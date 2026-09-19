@@ -117,22 +117,24 @@ pub async fn publish(
 
     let topic_ref = state.topics.get_or_create(&topic);
     let topic_name = topic.clone();
-    let envelope = topic_ref.publish(move |seq, id, time| {
-        Envelope::new_message(
-            topic_name,
-            seq,
-            id,
-            time,
-            title,
-            Some(message_text),
-            priority,
-            tags,
-            click,
-            content_type,
-            None,
-            None,
-        )
-    });
+    let envelope = topic_ref
+        .publish(move |seq, id, time| {
+            Envelope::new_message(
+                topic_name,
+                seq,
+                id,
+                time,
+                title,
+                Some(message_text),
+                priority,
+                tags,
+                click,
+                content_type,
+                None,
+                None,
+            )
+        })
+        .map_err(|e| AppError::Internal(format!("failed to persist message: {e}")))?;
 
     Ok(Json(envelope))
 }

@@ -6,9 +6,10 @@ pub mod acl;
 pub mod cache;
 pub mod users;
 
+use cache::Cache;
+
 /// Thin wrapper around the embedded `sled` database handle.
 pub struct Store {
-    #[allow(dead_code)]
     pub db: sled::Db,
 }
 
@@ -17,5 +18,12 @@ impl Store {
     pub fn open(data_dir: impl AsRef<Path>) -> sled::Result<Self> {
         let db = sled::open(data_dir)?;
         Ok(Self { db })
+    }
+
+    /// Builds a [`Cache`] handle over this store's database. `sled::Db` is
+    /// cheaply `Clone` (internally reference-counted), so this is just a
+    /// handle copy, not a reopen.
+    pub fn cache(&self) -> Cache {
+        Cache::new(self.db.clone())
     }
 }
