@@ -324,10 +324,7 @@ impl Topic {
                     }
                     _ => None,
                 },
-                SinceMarker::Id(id) => match ring.iter().position(|e| &e.id == id) {
-                    Some(pos) => Some(ring.iter().skip(pos + 1).cloned().collect()),
-                    None => None,
-                },
+                SinceMarker::Id(id) => ring.iter().position(|e| &e.id == id).map(|pos| ring.iter().skip(pos + 1).cloned().collect()),
             }
         };
 

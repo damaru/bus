@@ -149,10 +149,9 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
         (n, 3600)
     } else if let Some(n) = s.strip_suffix('m') {
         (n, 60)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
     } else {
-        return None;
+        let n = s.strip_suffix('s')?;
+        (n, 1)
     };
     num.parse::<i64>().ok().map(|n| n * mult)
 }
