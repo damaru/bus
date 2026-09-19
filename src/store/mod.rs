@@ -6,7 +6,9 @@ pub mod acl;
 pub mod cache;
 pub mod users;
 
+use acl::Acl;
 use cache::Cache;
+use users::Users;
 
 /// Thin wrapper around the embedded `sled` database handle.
 pub struct Store {
@@ -25,5 +27,15 @@ impl Store {
     /// handle copy, not a reopen.
     pub fn cache(&self) -> Cache {
         Cache::new(self.db.clone())
+    }
+
+    /// Builds a [`Users`] handle over this store's database.
+    pub fn users(&self) -> Users {
+        Users::new(self.db.clone())
+    }
+
+    /// Builds an [`Acl`] handle over this store's database.
+    pub fn acl(&self) -> Acl {
+        Acl::new(self.db.clone())
     }
 }

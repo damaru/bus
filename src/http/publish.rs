@@ -1,7 +1,9 @@
 //! `PUT`/`POST /{topic}` publish handler.
 
+use std::net::SocketAddr;
+
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, Uri};
 use axum::response::IntoResponse;
@@ -12,6 +14,7 @@ use crate::error::AppError;
 use crate::http::params;
 use crate::http::AppState;
 use crate::model::Envelope;
+use crate::store::acl::Permission;
 
 /// Matches ntfy's `emptyMessageBody` placeholder used when a published
 /// message has no text at all.
@@ -35,12 +38,16 @@ struct JsonPublishBody {
 pub async fn publish(
     State(state): State<AppState>,
     Path(topic): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: Uri,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     params::validate_topic_name(&topic)?;
     let query = params::parse_query(&uri);
+
+    let visitor = crate::auth::authenticate(&headers, &query, addr.ip(), &state.users, &state.auth_limiter)?;
+    crate::http::require_permission(&state, &visitor, &topic, Permission::Write)?;
 
     let content_type_header = headers
         .get(CONTENT_TYPE)

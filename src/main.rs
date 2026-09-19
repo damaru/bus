@@ -9,6 +9,8 @@ mod model;
 mod store;
 mod topic;
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -27,10 +29,15 @@ struct Cli {
 enum Command {
     /// Start the HTTP/WS server.
     Serve(Config),
-    /// Administrative subcommands (users, tokens, ACLs).
+    /// Administrative subcommands (users, tokens, ACLs). Operates directly
+    /// on the sled DB at `--data-dir`; stop `bus serve` first if it's
+    /// running against the same directory (sled allows only one process).
     Admin {
         #[command(subcommand)]
         cmd: admin::AdminCommand,
+        /// Directory of the sled embedded database (same as `bus serve --data-dir`).
+        #[arg(long, global = true, default_value = "./data")]
+        data_dir: PathBuf,
     },
 }
 
@@ -40,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve(config) => serve(config).await?,
-        Command::Admin { cmd } => admin::run(cmd),
+        Command::Admin { cmd, data_dir } => admin::run(cmd, data_dir)?,
     }
 
     Ok(())
@@ -59,15 +66,25 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let store = Arc::new(Store::open(&config.data_dir)?);
     let cache = Arc::new(store.cache());
     let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache.clone()));
+    let users = Arc::new(store.users());
+    let acl = Arc::new(store.acl());
+    let auth_limiter = Arc::new(auth::AuthLimiter::new());
 
     spawn_retention_sweep(cache.clone(), config.cache_duration, config.cache_count, config.cache_size);
 
-    let state = http::AppState { store, topics };
+    let state = http::AppState {
+        store,
+        topics,
+        users,
+        acl,
+        auth_limiter,
+        default_access: config.default_access,
+    };
     let app = http::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

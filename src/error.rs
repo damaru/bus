@@ -18,6 +18,7 @@ pub enum AppError {
     BadRequest(String),
     Unauthorized(String),
     Forbidden(String),
+    TooManyRequests(String),
     Internal(String),
 }
 
@@ -28,6 +29,7 @@ impl AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, 40000, msg.as_str()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 40100, msg.as_str()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, 40300, msg.as_str()),
+            AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, 42900, msg.as_str()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, 50000, msg.as_str()),
         }
     }

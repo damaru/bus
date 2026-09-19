@@ -3,12 +3,13 @@
 //! `handleSubscribeHTTP` from `refs/ntfy/server/server.go`.
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
@@ -19,6 +20,7 @@ use crate::error::AppError;
 use crate::http::params::{self, QueryFilter};
 use crate::http::AppState;
 use crate::model::{Envelope, Event, SinceMarker};
+use crate::store::acl::Permission;
 use crate::topic::{SubscriberId, Topic};
 
 /// App-level heartbeat interval for live subscribe streams, matching ntfy's
@@ -33,17 +35,33 @@ struct PreparedSubscribe {
 }
 
 /// Shared setup for all four subscribe endpoints: validates/splits the
-/// (possibly comma-separated) topic path segment, resolves each topic in
+/// (possibly comma-separated) topic path segment, authenticates the
+/// requester and requires **read** access to every named topic (denying
+/// the whole multi-topic request with 403 if any one topic is denied,
+/// matching ntfy's `authorizeTopic` middleware), resolves each topic in
 /// the registry, and parses `poll=`/`since=`/content filters.
-fn prepare(state: &AppState, topic_path: &str, headers: &HeaderMap, uri: &Uri) -> Result<PreparedSubscribe, AppError> {
+fn prepare(
+    state: &AppState,
+    topic_path: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    ip: std::net::IpAddr,
+) -> Result<PreparedSubscribe, AppError> {
     let names = params::split_topics(topic_path)?;
     let query = params::parse_query(uri);
+
+    let visitor = crate::auth::authenticate(headers, &query, ip, &state.users, &state.auth_limiter)?;
+    for name in &names {
+        crate::http::require_permission(state, &visitor, name, Permission::Read)?;
+    }
+
     let poll = params::read_bool_param(false, headers, &query, &["x-poll", "poll", "po"]);
     let since = params::parse_since(headers, &query, poll)?;
     let filters = params::parse_query_filters(headers, &query)?;
     let topics = names.iter().map(|n| state.topics.get_or_create(n)).collect();
     Ok(PreparedSubscribe { topics, poll, since, filters })
 }
+
 
 /// Drops a topic subscription when the holding stream frame is dropped
 /// (client disconnect, poll-mode completion, etc).
@@ -152,10 +170,11 @@ fn event_name(event: Event) -> &'static str {
 pub async fn subscribe_json(
     State(state): State<AppState>,
     Path(topic_path): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response, AppError> {
-    let p = prepare(&state, &topic_path, &headers, &uri)?;
+    let p = prepare(&state, &topic_path, &headers, &uri, addr.ip())?;
     let stream = envelope_stream(p.topics, p.poll, p.since, p.filters, topic_path).map(|env| {
         let mut line = serde_json::to_string(&env).unwrap_or_default();
         line.push('\n');
@@ -172,10 +191,11 @@ pub async fn subscribe_json(
 pub async fn subscribe_sse(
     State(state): State<AppState>,
     Path(topic_path): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response, AppError> {
-    let p = prepare(&state, &topic_path, &headers, &uri)?;
+    let p = prepare(&state, &topic_path, &headers, &uri, addr.ip())?;
     let stream = envelope_stream(p.topics, p.poll, p.since, p.filters, topic_path).map(|env| {
         let json = serde_json::to_string(&env).unwrap_or_default();
         let frame = if matches!(env.event, Event::Message | Event::MessageDelete | Event::MessageClear) {
@@ -198,10 +218,11 @@ pub async fn subscribe_sse(
 pub async fn subscribe_raw(
     State(state): State<AppState>,
     Path(topic_path): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<Response, AppError> {
-    let p = prepare(&state, &topic_path, &headers, &uri)?;
+    let p = prepare(&state, &topic_path, &headers, &uri, addr.ip())?;
     let stream = envelope_stream(p.topics, p.poll, p.since, p.filters, topic_path).map(|env| {
         let line = if env.event == Event::Message {
             let msg = env.message.unwrap_or_default().replace('\n', " ");
@@ -224,11 +245,12 @@ pub async fn subscribe_raw(
 pub async fn subscribe_ws(
     State(state): State<AppState>,
     Path(topic_path): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
-    let p = prepare(&state, &topic_path, &headers, &uri)?;
+    let p = prepare(&state, &topic_path, &headers, &uri, addr.ip())?;
     Ok(ws.on_upgrade(move |socket| run_ws(socket, p.topics, p.poll, p.since, p.filters, topic_path)))
 }
 
