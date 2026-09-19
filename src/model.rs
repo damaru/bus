@@ -1,8 +1,9 @@
-//! Message model: `Envelope`, `Event`, `SinceMarker` — ports `model/model.go`
-//! plus the bus/e2e wire-format extensions from PLAN.md section 4.1.
+//! Message model: `Envelope`, `Event`, `Control`, `SinceMarker` — ports
+//! `model/model.go` plus the bus/e2e wire-format extensions from PLAN.md
+//! section 4.1/4.2.
 //!
-//! `enc` and `control` are always `None` in M1; they are populated for real
-//! in M5 (e2e envelope) and M4 (bus control messages) respectively.
+//! `enc` is always `None` until M5 (e2e envelope); `control`/`Event::Control`
+//! are fully wired up as of M4 (bus extension).
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,8 @@ pub const MESSAGE_ID_LEN: usize = 12;
 const ID_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 /// Generates a random message ID: 12-character mixed-case alphanumeric,
-/// matching ntfy's `util.RandomString`/`GenerateMessageID`.
+/// matching ntfy's `util.RandomString`/`GenerateMessageID`. Reused as-is
+/// for bus `session_id`s (M4) — same entropy/shape requirements.
 pub fn generate_message_id() -> String {
     let mut rng = rand::thread_rng();
     (0..MESSAGE_ID_LEN)
@@ -37,7 +39,7 @@ pub fn now_unix() -> i64 {
 }
 
 /// Event type of an [`Envelope`]. Ports `model/model.go`'s event constants,
-/// plus the bus extension's `control` event (unreachable until M4).
+/// plus the bus extension's `control` event (M4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
@@ -47,10 +49,61 @@ pub enum Event {
     MessageDelete,
     MessageClear,
     PollRequest,
-    /// NEW: bus control envelope (join/leave/presence/typing/ack/...).
-    /// Not constructed anywhere until M4 wires up `/bus`.
-    #[allow(dead_code)]
+    /// Bus control envelope (join/leave/presence/typing/ack/ping/pong/
+    /// error/close) — see [`Control`]. Wired up in M4's `/bus` endpoint.
     Control,
+}
+
+/// Bus control-message type (PLAN.md section 4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlType {
+    /// server -> participants: emitted when a bus participant connects.
+    Join,
+    /// server -> participants: emitted when a bus participant disconnects.
+    Leave,
+    /// server -> new participant: full roster snapshot on connect.
+    Presence,
+    /// client -> relayed to others: ephemeral, never cached.
+    Typing,
+    /// client -> relayed to others: delivery/read acknowledgement
+    /// referencing a message `id` (payload shape is client-defined).
+    Ack,
+    /// client -> server: app-level heartbeat request.
+    Ping,
+    /// server -> client: app-level heartbeat reply.
+    Pong,
+    /// server -> client: malformed frame, rate-limited, permission denied.
+    Error,
+    /// server -> client: server is terminating the connection.
+    Close,
+}
+
+/// Bus control-message payload, present on an [`Envelope`] only when
+/// `event == Event::Control`. Ports PLAN.md section 4.2's `control` shape:
+/// `{ "type": ..., "from": ..., "data": { ... } }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Control {
+    #[serde(rename = "type")]
+    pub r#type: ControlType,
+    /// Sender label of whoever originated this control message (server
+    /// itself uses `"server"` for `join`/`leave`/`presence`/`error`/`close`).
+    pub from: String,
+    /// Free-form, type-specific payload (e.g. the roster array for
+    /// `presence`, or a client-defined ack shape for `ack`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data: Option<serde_json::Value>,
+}
+
+impl Control {
+    pub fn new(r#type: ControlType, from: impl Into<String>) -> Self {
+        Self { r#type, from: from.into(), data: None }
+    }
+
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(data);
+        self
+    }
 }
 
 /// The message envelope: superset of ntfy's `model.Message`. See PLAN.md
@@ -64,8 +117,10 @@ pub struct Envelope {
     pub expires: Option<i64>,
     pub event: Event,
     pub topic: String,
-    /// NEW: opaque client-supplied participant/session label. Always `None`
-    /// until M4 (bus participants).
+    /// Opaque client-supplied participant/session label (PLAN.md 4.1's
+    /// NEW `sender` field). Set on bus-originated `message`/`control`
+    /// envelopes as of M4; still `None` for plain HTTP-published messages
+    /// (no participant concept there).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,10 +143,11 @@ pub struct Envelope {
     /// `encoding == "e2e"`. Always `None` until M5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enc: Option<serde_json::Value>,
-    /// NEW: bus control payload, only present when `event == "control"`.
-    /// Always `None` until M4.
+    /// Bus control payload, present only when `event == Event::Control`
+    /// (M4). `None`/omitted for every other event, preserving the M1-era
+    /// JSON shape for plain ntfy-compatible clients.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub control: Option<serde_json::Value>,
+    pub control: Option<Control>,
 }
 
 impl Envelope {
@@ -132,8 +188,28 @@ impl Envelope {
         }
     }
 
+    /// Builds a `message` event envelope tagged with a bus participant's
+    /// `sender` label (PLAN.md 4.1). Used by `Topic::bus_publish_message`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_bus_message(
+        topic: impl Into<String>,
+        seq: u64,
+        id: String,
+        time: i64,
+        sender: String,
+        title: Option<String>,
+        message: Option<String>,
+        priority: Option<u8>,
+        tags: Vec<String>,
+        click: Option<String>,
+    ) -> Self {
+        let mut env = Self::new_message(topic, seq, id, time, title, message, priority, tags, click, None, None, None);
+        env.sender = Some(sender);
+        env
+    }
+
     /// `open` event: sent as the first frame on a live (non-poll) subscribe
-    /// stream.
+    /// stream, including `/bus` connections.
     pub fn open(topic: impl Into<String>) -> Self {
         Self::ephemeral(Event::Open, topic)
     }
@@ -141,6 +217,15 @@ impl Envelope {
     /// `keepalive` event: sent periodically on a live subscribe stream.
     pub fn keepalive(topic: impl Into<String>) -> Self {
         Self::ephemeral(Event::Keepalive, topic)
+    }
+
+    /// Builds a `control` event envelope carrying `control`. `seq` is
+    /// always `0` (control messages are ephemeral, never persisted/counted
+    /// against the topic's sequence — PLAN.md 4.2).
+    pub fn control(topic: impl Into<String>, control: Control) -> Self {
+        let mut env = Self::ephemeral(Event::Control, topic);
+        env.control = Some(control);
+        env
     }
 
     fn ephemeral(event: Event, topic: impl Into<String>) -> Self {
@@ -169,7 +254,8 @@ impl Envelope {
 /// replayed, as parsed from `since=` (ports `model.SinceMarker`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SinceMarker {
-    /// No backlog at all (default for live streams without `since=`).
+    /// No backlog at all (default for live streams without `since=`, and
+    /// the default for `/bus` connections per PLAN.md 5.2).
     None,
     /// Every cached message.
     All,

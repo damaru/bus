@@ -51,6 +51,7 @@ pub fn router(state: AppState) -> Router {
         .route("/:topic/sse", get(subscribe::subscribe_sse))
         .route("/:topic/raw", get(subscribe::subscribe_raw))
         .route("/:topic/ws", get(subscribe::subscribe_ws))
+        .route("/:topic/bus", get(bus::bus_ws))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

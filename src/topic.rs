@@ -1,21 +1,32 @@
 //! `TopicRegistry`, `Topic`, in-memory broadcast fanout (ports
-//! `server/topic.go`), now backed by the sled-persisted [`Cache`] for
-//! durability and restart-safe sequence numbers (PLAN.md section 8). Bus
-//! participant/presence tracking lands in M4.
+//! `server/topic.go`), backed by the sled-persisted [`Cache`] for
+//! durability and restart-safe sequence numbers (PLAN.md section 8), plus
+//! the bus extension's participant/presence tracking (PLAN.md section 5.2,
+//! M4).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
+use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::model::{generate_message_id, now_unix, Envelope, SinceMarker};
+use crate::model::{generate_message_id, now_unix, Control, ControlType, Envelope, SinceMarker};
 use crate::store::cache::Cache;
 
 /// Identifies a single subscriber's fanout channel within a [`Topic`].
+/// Every live consumer of a topic — plain `/json`/`/sse`/`/raw`/`/ws`
+/// subscribers *and* `/bus` participants alike — gets one of these, so a
+/// message published from any source (HTTP publish or a bus participant)
+/// reaches everyone through the same fanout path.
 pub type SubscriberId = u64;
+
+/// Identifies a single `/bus` participant (a chat-style identity layered on
+/// top of a [`SubscriberId`]). Reuses the same random-id shape as message
+/// ids (`model::generate_message_id`).
+pub type SessionId = String;
 
 /// Bounded channel capacity for each subscriber's fanout `mpsc`. If a
 /// subscriber can't keep up and the channel fills, it is dropped rather than
@@ -30,9 +41,50 @@ const SUBSCRIBER_CHANNEL_CAPACITY: usize = 256;
 /// history is allowed to grow.
 const MAX_RING_CAPACITY: usize = 10_000;
 
+/// A `/bus` participant: a chat-style identity (PLAN.md section 8's
+/// `Participant`). Not constructed for plain `/json`/`/sse`/`/raw`/`/ws`
+/// subscribers — those only ever touch `Topic::subscribers`, never
+/// `Topic::participants`.
+#[derive(Debug, Clone)]
+struct Participant {
+    session_id: SessionId,
+    /// Client-supplied "sender" label (PLAN.md 4.1), e.g. a device/user name.
+    sender_label: String,
+    /// Whether this participant may publish `message`/relay-eligible
+    /// `control` frames (checked both by the `/bus` handler up front and
+    /// again here as defense-in-depth).
+    can_write: bool,
+    joined_at: i64,
+    /// The underlying fanout channel this participant shares with every
+    /// other subscriber on the topic.
+    subscriber_id: SubscriberId,
+}
+
+/// Public-facing roster entry, used to build the `presence` control
+/// message's `data` payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct ParticipantInfo {
+    pub session_id: SessionId,
+    pub sender: String,
+    pub can_write: bool,
+    pub joined_at: i64,
+}
+
+impl From<&Participant> for ParticipantInfo {
+    fn from(p: &Participant) -> Self {
+        Self {
+            session_id: p.session_id.clone(),
+            sender: p.sender_label.clone(),
+            can_write: p.can_write,
+            joined_at: p.joined_at,
+        }
+    }
+}
+
 /// A single topic: recent-message ring buffer (fast path), a mirror of the
-/// persisted sequence counter, live subscriber fanout channels, and a
-/// handle to the sled-backed cache for durability + backlog fallback.
+/// persisted sequence counter, live subscriber fanout channels, bus
+/// participant/presence tracking, and a handle to the sled-backed cache
+/// for durability + backlog fallback.
 pub struct Topic {
     name: String,
     /// Mirrors the persisted `topic_meta.last_seq`. Initialized from
@@ -47,6 +99,10 @@ pub struct Topic {
     subscribers: Mutex<HashMap<SubscriberId, mpsc::Sender<Envelope>>>,
     next_subscriber_id: AtomicU64,
     cache: Arc<Cache>,
+    /// Bus participants currently joined (PLAN.md section 8's
+    /// `participants: HashMap<SessionId, Participant>`), separate from
+    /// `subscribers` since not every subscriber is a bus participant.
+    participants: Mutex<HashMap<SessionId, Participant>>,
 }
 
 impl Topic {
@@ -63,6 +119,7 @@ impl Topic {
             subscribers: Mutex::new(HashMap::new()),
             next_subscriber_id: AtomicU64::new(0),
             cache,
+            participants: Mutex::new(HashMap::new()),
         }
     }
 
@@ -115,14 +172,17 @@ impl Topic {
         Ok(envelope)
     }
 
-    /// Sends `envelope` to every live subscriber's channel. Subscribers
-    /// whose channel is full or closed are dropped (see
-    /// `SUBSCRIBER_CHANNEL_CAPACITY` doc comment).
-    fn fan_out(&self, envelope: &Envelope) {
+    /// Sends `envelope` to every live subscriber's channel except
+    /// (optionally) `exclude`. Subscribers whose channel is full or closed
+    /// are dropped (see `SUBSCRIBER_CHANNEL_CAPACITY` doc comment).
+    fn fan_out_filtered(&self, envelope: &Envelope, exclude: Option<SubscriberId>) {
         let mut dead = Vec::new();
         {
             let subs = self.subscribers.lock().unwrap();
             for (id, tx) in subs.iter() {
+                if Some(*id) == exclude {
+                    continue;
+                }
                 if tx.try_send(envelope.clone()).is_err() {
                     dead.push(*id);
                 }
@@ -136,8 +196,28 @@ impl Topic {
         }
     }
 
+    fn fan_out(&self, envelope: &Envelope) {
+        self.fan_out_filtered(envelope, None);
+    }
+
+    fn fan_out_except(&self, envelope: &Envelope, exclude: SubscriberId) {
+        self.fan_out_filtered(envelope, Some(exclude));
+    }
+
+    /// Sends `envelope` to exactly one subscriber's channel (used for
+    /// direct, non-broadcast replies like `ping` -> `pong`). Silently
+    /// no-ops if the target has disconnected.
+    fn send_to(&self, target: SubscriberId, envelope: Envelope) {
+        let tx = self.subscribers.lock().unwrap().get(&target).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.try_send(envelope);
+        }
+    }
+
     /// Registers a new live subscriber, returning its id (for
     /// [`Topic::unsubscribe`]) and the receiving end of its fanout channel.
+    /// Used directly by the plain `/json`/`/sse`/`/raw`/`/ws` endpoints;
+    /// `/bus` participants get the same channel via [`Topic::bus_join`].
     pub fn subscribe(&self) -> (SubscriberId, mpsc::Receiver<Envelope>) {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
@@ -216,6 +296,127 @@ impl Topic {
                 }
             }
         }
+    }
+
+    // ---- Bus extension (PLAN.md 5.2 / M4) ----
+
+    /// Registers a new `/bus` participant: allocates a session id, shares
+    /// the same fanout channel every subscriber uses (so bus participants
+    /// see regular HTTP-published messages, and vice versa — PLAN.md 5.2's
+    /// full interop requirement falls out of reusing `Topic::subscribe`'s
+    /// machinery here rather than a parallel structure), and broadcasts a
+    /// `join` control message to every *other* current subscriber. Returns
+    /// the new session id and the receiving end of its fanout channel.
+    ///
+    /// Callers should snapshot [`Topic::roster`] *before* calling this (to
+    /// build a `presence` message that reflects "everyone but me"); once
+    /// `bus_join` returns, the new participant is already part of the
+    /// roster and of the join broadcast's audience exclusion.
+    pub fn bus_join(&self, sender_label: String, can_write: bool) -> (SessionId, mpsc::Receiver<Envelope>) {
+        let (subscriber_id, rx) = self.subscribe();
+        let session_id = generate_message_id();
+
+        let participant = Participant {
+            session_id: session_id.clone(),
+            sender_label: sender_label.clone(),
+            can_write,
+            joined_at: now_unix(),
+            subscriber_id,
+        };
+        self.participants.lock().unwrap().insert(session_id.clone(), participant);
+
+        let join = Envelope::control(self.name.clone(), Control::new(ControlType::Join, sender_label));
+        self.fan_out_except(&join, subscriber_id);
+
+        (session_id, rx)
+    }
+
+    /// Removes a `/bus` participant (on WS close/error) and broadcasts a
+    /// `leave` control message to the remaining participants/subscribers.
+    /// A no-op if `session_id` is unknown (already left, or never joined).
+    pub fn bus_leave(&self, session_id: &str) {
+        let participant = self.participants.lock().unwrap().remove(session_id);
+        if let Some(p) = participant {
+            self.unsubscribe(p.subscriber_id);
+            let leave = Envelope::control(self.name.clone(), Control::new(ControlType::Leave, p.sender_label));
+            // The leaving participant's own channel is already removed
+            // above, so a plain (unfiltered) fan-out is equivalent to
+            // "all other participants" here.
+            self.fan_out(&leave);
+        }
+    }
+
+    /// Snapshot of every currently-joined `/bus` participant, used to
+    /// build the `presence` control message sent to a newly-connecting
+    /// client.
+    pub fn roster(&self) -> Vec<ParticipantInfo> {
+        self.participants.lock().unwrap().values().map(ParticipantInfo::from).collect()
+    }
+
+    /// Publishes a `message` event on behalf of a `/bus` participant,
+    /// tagged with their `sender` label — otherwise identical to the HTTP
+    /// publish path (seq allocation, durable sled write, ring buffer,
+    /// fan-out to every subscriber). Looks up `can_write` from the
+    /// participant record itself (defense-in-depth: the `/bus` handler
+    /// should already have checked this before calling, but a session
+    /// that was write-capable at connect time and got revoked mid-session
+    /// would still be caught here).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bus_publish_message(
+        &self,
+        session_id: &str,
+        title: Option<String>,
+        message: Option<String>,
+        priority: Option<u8>,
+        tags: Vec<String>,
+        click: Option<String>,
+    ) -> Result<Envelope> {
+        let sender_label = {
+            let participants = self.participants.lock().unwrap();
+            let p = participants.get(session_id).context("unknown bus session")?;
+            if !p.can_write {
+                anyhow::bail!("permission denied: read-only participant");
+            }
+            p.sender_label.clone()
+        };
+        let topic_name = self.name.clone();
+        self.publish(move |seq, id, time| {
+            Envelope::new_bus_message(topic_name, seq, id, time, sender_label, title, message, priority, tags, click)
+        })
+    }
+
+    /// Handles a client-originated `control` frame (`typing`/`ack`/`ping`
+    /// only — any other type from a client is rejected by the caller
+    /// before this is reached). `typing`/`ack` are relayed to every *other*
+    /// participant/subscriber and never persisted (PLAN.md 4.2: ephemeral
+    /// only). `ping` is answered directly to the sender with a `pong` —
+    /// never broadcast.
+    pub fn bus_relay_control(&self, session_id: &str, control_type: ControlType, data: Option<serde_json::Value>) -> Result<()> {
+        let (sender_label, subscriber_id, can_write) = {
+            let participants = self.participants.lock().unwrap();
+            let p = participants.get(session_id).context("unknown bus session")?;
+            (p.sender_label.clone(), p.subscriber_id, p.can_write)
+        };
+        if !can_write {
+            anyhow::bail!("permission denied: read-only participant");
+        }
+
+        match control_type {
+            ControlType::Ping => {
+                let pong = Envelope::control(self.name.clone(), Control::new(ControlType::Pong, "server"));
+                self.send_to(subscriber_id, pong);
+            }
+            ControlType::Typing | ControlType::Ack => {
+                let mut control = Control::new(control_type, sender_label);
+                if let Some(d) = data {
+                    control = control.with_data(d);
+                }
+                let envelope = Envelope::control(self.name.clone(), control);
+                self.fan_out_except(&envelope, subscriber_id);
+            }
+            other => anyhow::bail!("clients may not send control type '{other:?}'"),
+        }
+        Ok(())
     }
 }
 
