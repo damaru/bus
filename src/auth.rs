@@ -49,8 +49,13 @@ impl Visitor {
 /// continuously refilling — but the numbers are chosen to match ntfy's
 /// defaults closely: `DefaultVisitorAuthFailureLimitBurst = 30` failures,
 /// `DefaultVisitorAuthFailureLimitReplenish = 1 minute`.
+///
+/// Built on [`WindowCounter`], the same fixed-window primitive [`PublishLimiter`]
+/// (M6) uses for the separate publish-rate limit — this only *records* on
+/// an actual auth failure (unlike `PublishLimiter`, which records every
+/// attempt), so successful logins never count against the budget.
 pub struct AuthLimiter {
-    failures: DashMap<IpAddr, (AtomicU32, Mutex<Instant>)>,
+    counter: WindowCounter<IpAddr>,
 }
 
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -64,37 +69,115 @@ impl Default for AuthLimiter {
 
 impl AuthLimiter {
     pub fn new() -> Self {
-        Self { failures: DashMap::new() }
+        Self { counter: WindowCounter::new(AUTH_FAILURE_WINDOW) }
     }
 
     /// True if `ip` is still allowed to attempt authentication.
     fn allowed(&self, ip: IpAddr) -> bool {
-        match self.failures.get(&ip) {
-            None => true,
-            Some(entry) => {
-                let window_start = *entry.1.lock().unwrap();
-                if window_start.elapsed() > AUTH_FAILURE_WINDOW {
-                    true
-                } else {
-                    entry.0.load(Ordering::Relaxed) < AUTH_FAILURE_MAX
-                }
-            }
-        }
+        self.counter.peek(&ip) < AUTH_FAILURE_MAX
     }
 
     /// Records a failed authentication attempt from `ip`, resetting the
     /// window if it has expired.
     fn record_failure(&self, ip: IpAddr) {
+        self.counter.increment(&ip);
+    }
+}
+
+/// A rate-limit key: per-authenticated-user when available, falling back
+/// to per-IP for anonymous requests (M6 publish rate limiter). Distinct
+/// user accounts sharing an IP (e.g. behind NAT) don't share a budget;
+/// anonymous requests from different IPs don't share a budget either.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RateKey {
+    User(String),
+    Ip(IpAddr),
+}
+
+impl RateKey {
+    /// Builds the rate-limit key for a request: the authenticated
+    /// username if there is one, else the client's IP.
+    pub fn for_visitor(visitor: &Visitor, ip: IpAddr) -> Self {
+        match &visitor.username {
+            Some(username) => RateKey::User(username.clone()),
+            None => RateKey::Ip(ip),
+        }
+    }
+}
+
+/// Per-visitor publish rate limiter (M6) — separate from [`AuthLimiter`]
+/// (which only throttles bad-credential *attempts*): this throttles
+/// legitimate, frequent publish requests, so a single chatty client can't
+/// starve a topic or the retention sweep. Fixed 60-second window; `max` is
+/// `Config::publish_rate_limit` (messages per window), configurable via
+/// `bus serve --publish-rate-limit`.
+pub struct PublishLimiter {
+    counter: WindowCounter<RateKey>,
+    max: u32,
+}
+
+const PUBLISH_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+impl PublishLimiter {
+    pub fn new(max: u32) -> Self {
+        Self { counter: WindowCounter::new(PUBLISH_RATE_WINDOW), max }
+    }
+
+    /// Records one publish attempt for `key` and returns `true` if it's
+    /// still within budget (every attempt counts, unlike `AuthLimiter`
+    /// which only counts failures — a successful publish is exactly the
+    /// kind of traffic this limiter exists to throttle).
+    pub fn check(&self, key: RateKey) -> bool {
+        self.counter.increment(&key) <= self.max
+    }
+}
+
+/// Generic fixed-window request counter, keyed by `K` (an IP address, a
+/// username, ...). Shared building block for [`AuthLimiter`] and
+/// [`PublishLimiter`]: each key gets its own window that resets once
+/// `window` has elapsed since it was last (re)started. This is a
+/// deliberately simple stand-in for a true token bucket — see
+/// [`AuthLimiter`]'s doc comment for the tradeoff — reused here rather than
+/// duplicated per PLAN.md M6's "reuse/extend that pattern" guidance.
+struct WindowCounter<K: Eq + std::hash::Hash + Clone> {
+    entries: DashMap<K, (AtomicU32, Mutex<Instant>)>,
+    window: Duration,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> WindowCounter<K> {
+    fn new(window: Duration) -> Self {
+        Self { entries: DashMap::new(), window }
+    }
+
+    /// Current count within `key`'s window, without incrementing (`0` if
+    /// the window has expired or `key` was never seen).
+    fn peek(&self, key: &K) -> u32 {
+        match self.entries.get(key) {
+            None => 0,
+            Some(entry) => {
+                if entry.1.lock().unwrap().elapsed() > self.window {
+                    0
+                } else {
+                    entry.0.load(Ordering::Relaxed)
+                }
+            }
+        }
+    }
+
+    /// Increments `key`'s count (resetting the window first if it has
+    /// expired) and returns the count *after* incrementing.
+    fn increment(&self, key: &K) -> u32 {
         let entry = self
-            .failures
-            .entry(ip)
+            .entries
+            .entry(key.clone())
             .or_insert_with(|| (AtomicU32::new(0), Mutex::new(Instant::now())));
         let mut window_start = entry.1.lock().unwrap();
-        if window_start.elapsed() > AUTH_FAILURE_WINDOW {
+        if window_start.elapsed() > self.window {
             *window_start = Instant::now();
             entry.0.store(1, Ordering::Relaxed);
+            1
         } else {
-            entry.0.fetch_add(1, Ordering::Relaxed);
+            entry.0.fetch_add(1, Ordering::Relaxed) + 1
         }
     }
 }

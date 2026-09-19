@@ -58,7 +58,24 @@ fn prepare(
     let poll = params::read_bool_param(false, headers, &query, &["x-poll", "poll", "po"]);
     let since = params::parse_since(headers, &query, poll)?;
     let filters = params::parse_query_filters(headers, &query)?;
-    let topics = names.iter().map(|n| state.topics.get_or_create(n)).collect();
+    let topics: Vec<Arc<Topic>> = names
+        .iter()
+        .map(|n| state.topics.get_or_create(n))
+        .collect::<Result<Vec<_>, AppError>>()?;
+
+    // M6: reject (429) before committing to a streaming response/WS
+    // upgrade if any requested topic is already at its subscriber
+    // capacity — see `Topic::subscriber_capacity_available`'s doc comment
+    // for why this check happens here rather than inside `subscribe()`.
+    for t in &topics {
+        if !t.subscriber_capacity_available() {
+            return Err(AppError::TooManyRequests(format!(
+                "topic '{}' has reached its subscriber capacity",
+                t.name()
+            )));
+        }
+    }
+
     Ok(PreparedSubscribe { topics, poll, since, filters })
 }
 

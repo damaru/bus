@@ -103,10 +103,32 @@ pub struct Topic {
     /// `participants: HashMap<SessionId, Participant>`), separate from
     /// `subscribers` since not every subscriber is a bus participant.
     participants: Mutex<HashMap<SessionId, Participant>>,
+    /// Max concurrent entries in `subscribers` for *this* topic (M6).
+    max_subscribers_per_topic: u64,
+    /// Max concurrent entries in `participants` for *this* topic (M6) —
+    /// tighter than `max_subscribers_per_topic`, see `Config`'s doc
+    /// comment on `max_bus_participants_per_topic`.
+    max_bus_per_topic: u64,
+    /// Shared across every `Topic` in the registry (M6): total live
+    /// subscriber count server-wide, checked against
+    /// `max_subscribers_total` as a global soft cap layered on top of the
+    /// per-topic cap (PLAN.md M6: "a per-topic cap composed into a global
+    /// soft cap is reasonable").
+    total_subscribers: Arc<AtomicU64>,
+    max_subscribers_total: u64,
 }
 
 impl Topic {
-    fn new(name: String, ring_cap: usize, cache: Arc<Cache>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: String,
+        ring_cap: usize,
+        cache: Arc<Cache>,
+        max_subscribers_per_topic: u64,
+        max_bus_per_topic: u64,
+        total_subscribers: Arc<AtomicU64>,
+        max_subscribers_total: u64,
+    ) -> Self {
         let last_seq = cache.last_seq(&name).unwrap_or_else(|e| {
             tracing::warn!(topic = %name, error = %e, "failed to read persisted last_seq, starting from 0");
             0
@@ -120,6 +142,10 @@ impl Topic {
             next_subscriber_id: AtomicU64::new(0),
             cache,
             participants: Mutex::new(HashMap::new()),
+            max_subscribers_per_topic,
+            max_bus_per_topic,
+            total_subscribers,
+            max_subscribers_total,
         }
     }
 
@@ -214,20 +240,53 @@ impl Topic {
         }
     }
 
+    /// True if this topic currently has room for one more subscriber,
+    /// under *both* the per-topic and the global soft caps (M6). Checked
+    /// by callers (`http::subscribe::prepare`, `http::bus::bus_ws`)
+    /// *before* committing to a streaming response/WS upgrade, so a
+    /// capacity rejection can still be a clean HTTP 429 rather than an
+    /// upgrade that immediately gets dropped. `Topic::subscribe` itself
+    /// stays infallible and doesn't re-check — see its doc comment for
+    /// the accepted TOCTOU tradeoff.
+    pub fn subscriber_capacity_available(&self) -> bool {
+        let per_topic = self.subscribers.lock().unwrap().len() as u64;
+        per_topic < self.max_subscribers_per_topic
+            && self.total_subscribers.load(Ordering::Relaxed) < self.max_subscribers_total
+    }
+
+    /// True if this topic currently has room for one more `/bus`
+    /// participant, under the per-topic bus cap (M6). Bus participants are
+    /// also subscribers, so this is checked *in addition to*
+    /// [`Topic::subscriber_capacity_available`], not instead of it.
+    pub fn bus_capacity_available(&self) -> bool {
+        (self.participants.lock().unwrap().len() as u64) < self.max_bus_per_topic
+    }
+
     /// Registers a new live subscriber, returning its id (for
     /// [`Topic::unsubscribe`]) and the receiving end of its fanout channel.
     /// Used directly by the plain `/json`/`/sse`/`/raw`/`/ws` endpoints;
     /// `/bus` participants get the same channel via [`Topic::bus_join`].
+    ///
+    /// Infallible and unconditional: capacity is enforced earlier, by
+    /// [`Topic::subscriber_capacity_available`], at the point where the
+    /// caller can still return a clean HTTP error instead of an upgrade
+    /// that would have to be torn back down. Since that check and this
+    /// call aren't atomic together, concurrent requests can in rare cases
+    /// push a topic slightly past its cap — an accepted soft-cap tradeoff
+    /// (PLAN.md M6 explicitly calls the global limit a "soft cap").
     pub fn subscribe(&self) -> (SubscriberId, mpsc::Receiver<Envelope>) {
         let (tx, rx) = mpsc::channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let id = self.next_subscriber_id.fetch_add(1, Ordering::SeqCst);
         self.subscribers.lock().unwrap().insert(id, tx);
+        self.total_subscribers.fetch_add(1, Ordering::Relaxed);
         (id, rx)
     }
 
     /// Removes a subscriber, e.g. on client disconnect.
     pub fn unsubscribe(&self, id: SubscriberId) {
-        self.subscribers.lock().unwrap().remove(&id);
+        if self.subscribers.lock().unwrap().remove(&id).is_some() {
+            self.total_subscribers.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Returns entries matching `since`, oldest first, using the in-memory
@@ -346,6 +405,28 @@ impl Topic {
         }
     }
 
+    /// Sends a `close` control message (PLAN.md section 4.2: "server is
+    /// terminating the connection") directly to every currently-joined
+    /// `/bus` participant on this topic — used during graceful shutdown
+    /// (M6) so bus clients get an explicit heads-up before the process
+    /// exits, rather than just seeing the socket drop. Sent only to bus
+    /// participants (not every plain `/json`/`/sse`/`/raw`/`/ws`
+    /// subscriber), matching `close`'s documented direction
+    /// ("server -> client") in the bus control-message table.
+    pub fn broadcast_close(&self) {
+        let targets: Vec<SubscriberId> = {
+            let participants = self.participants.lock().unwrap();
+            participants.values().map(|p| p.subscriber_id).collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let close = Envelope::control(self.name.clone(), Control::new(ControlType::Close, "server"));
+        for subscriber_id in targets {
+            self.send_to(subscriber_id, close.clone());
+        }
+    }
+
     /// Snapshot of every currently-joined `/bus` participant, used to
     /// build the `presence` control message sent to a newly-connecting
     /// client.
@@ -438,6 +519,17 @@ impl Topic {
     }
 }
 
+/// Connection/topic caps for the whole registry (M6 hardening), mirroring
+/// `Config`'s `max_topics`/`max_subscribers_per_topic`/
+/// `max_subscribers_total`/`max_bus_participants_per_topic` CLI flags.
+#[derive(Debug, Clone, Copy)]
+pub struct TopicLimits {
+    pub max_topics: usize,
+    pub max_subscribers_per_topic: u64,
+    pub max_subscribers_total: u64,
+    pub max_bus_participants_per_topic: u64,
+}
+
 /// In-memory registry of all known topics, created lazily on first
 /// publish/subscribe. The registry itself is never persisted (per PLAN.md
 /// section 8), but each [`Topic`] is now backed by the sled [`Cache`] for
@@ -446,17 +538,23 @@ pub struct TopicRegistry {
     topics: DashMap<String, Arc<Topic>>,
     ring_cap: usize,
     cache: Arc<Cache>,
+    limits: TopicLimits,
+    /// Shared with every `Topic` this registry creates — see
+    /// `Topic::total_subscribers`'s doc comment.
+    total_subscribers: Arc<AtomicU64>,
 }
 
 impl TopicRegistry {
     /// `ring_cap` bounds each topic's in-memory backlog (clamped to
     /// [`MAX_RING_CAPACITY`]); `cache` is the shared sled-backed store all
-    /// topics persist through.
-    pub fn new(ring_cap: usize, cache: Arc<Cache>) -> Self {
+    /// topics persist through; `limits` are the M6 connection/topic caps.
+    pub fn new(ring_cap: usize, cache: Arc<Cache>, limits: TopicLimits) -> Self {
         Self {
             topics: DashMap::new(),
             ring_cap: ring_cap.clamp(1, MAX_RING_CAPACITY),
             cache,
+            limits,
+            total_subscribers: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -464,10 +562,50 @@ impl TopicRegistry {
     /// created topic has its in-memory seq mirror initialized from
     /// [`Cache::last_seq`], so publishing continues the sequence correctly
     /// after a restart instead of starting over at 0/1.
-    pub fn get_or_create(&self, name: &str) -> Arc<Topic> {
-        self.topics
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(Topic::new(name.to_string(), self.ring_cap, self.cache.clone())))
-            .clone()
+    ///
+    /// Fails with `429 Too Many Requests` (M6) only when `name` doesn't
+    /// exist yet *and* the registry is already at `max_topics` — an
+    /// already-existing topic is never blocked, no matter how many topics
+    /// exist. `429` (rather than `503`) was chosen to match the other M6
+    /// capacity rejections (rate limit, connection caps): these are all
+    /// "you've hit a limit, back off/try elsewhere" conditions specific to
+    /// the request, not a server-wide outage, so `429` fits better than
+    /// `503` (documented milestone decision).
+    pub fn get_or_create(&self, name: &str) -> Result<Arc<Topic>, crate::error::AppError> {
+        if let Some(existing) = self.topics.get(name) {
+            return Ok(existing.clone());
+        }
+        if self.topics.len() >= self.limits.max_topics {
+            return Err(crate::error::AppError::TooManyRequests(format!(
+                "server has reached its max-topics limit ({})",
+                self.limits.max_topics
+            )));
+        }
+        // Note: the len() check above and this insert aren't atomic
+        // together, so concurrent creation of several brand-new distinct
+        // topic names can in rare cases overshoot max_topics by a small
+        // amount — the same accepted soft-cap tradeoff as
+        // `Topic::subscribe` (see its doc comment).
+        let topic = self.topics.entry(name.to_string()).or_insert_with(|| {
+            Arc::new(Topic::new(
+                name.to_string(),
+                self.ring_cap,
+                self.cache.clone(),
+                self.limits.max_subscribers_per_topic,
+                self.limits.max_bus_participants_per_topic,
+                self.total_subscribers.clone(),
+                self.limits.max_subscribers_total,
+            ))
+        });
+        Ok(topic.clone())
+    }
+
+    /// Broadcasts a `close` control message to every `/bus` participant on
+    /// every topic — called once at the start of graceful shutdown (M6),
+    /// see `Topic::broadcast_close`.
+    pub fn broadcast_shutdown_close(&self) {
+        for entry in self.topics.iter() {
+            entry.value().broadcast_close();
+        }
     }
 }

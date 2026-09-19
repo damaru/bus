@@ -54,6 +54,17 @@ pub async fn publish(
     let visitor = crate::auth::authenticate(&headers, &query, addr.ip(), &state.users, &state.auth_limiter)?;
     crate::http::require_permission(&state, &visitor, &topic, Permission::Write)?;
 
+    // M6: per-visitor publish rate limit (separate from the M3 auth-failure
+    // limiter above) — throttles legitimate, frequent publish traffic.
+    // Checked after auth/ACL so a request that would be rejected anyway
+    // doesn't consume budget, but before any body parsing.
+    let rate_key = crate::auth::RateKey::for_visitor(&visitor, addr.ip());
+    if !state.publish_limiter.check(rate_key) {
+        return Err(AppError::TooManyRequests(
+            "publish rate limit exceeded, slow down".to_string(),
+        ));
+    }
+
     let content_type_header = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -141,7 +152,7 @@ pub async fn publish(
     // Never decodes/inspects message/title content beyond a size cap.
     params::validate_e2e(encoding.as_deref(), enc.as_ref(), Some(&message_text), title.as_deref())?;
 
-    let topic_ref = state.topics.get_or_create(&topic);
+    let topic_ref = state.topics.get_or_create(&topic)?;
     let topic_name = topic.clone();
     let envelope = topic_ref
         .publish(move |seq, id, time| {

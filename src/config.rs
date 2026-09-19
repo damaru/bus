@@ -41,6 +41,61 @@ pub struct Config {
     /// Default access policy when no ACL entry matches.
     #[arg(long, value_enum, default_value_t = DefaultAccess::ReadWrite)]
     pub default_access: DefaultAccess,
+
+    /// Max publish requests allowed per 60-second window, per authenticated
+    /// user (falling back to per-IP for anonymous publishers). Separate
+    /// from the auth-failure limiter (M3): this one throttles legitimate,
+    /// frequent publish traffic, not bad credentials. Inspired by ntfy's
+    /// `DefaultVisitorRequestLimitBurst = 60` general per-visitor request
+    /// budget (`refs/ntfy/server/config.go`); reused directly as a
+    /// reasonable "messages per minute" default for a single-node deploy.
+    #[arg(long, default_value_t = 60)]
+    pub publish_rate_limit: u32,
+
+    /// Max size (bytes) of a single published message: enforced both on
+    /// `PUT`/`POST /{topic}` request bodies (via axum's `DefaultBodyLimit`)
+    /// and on incoming `/bus` WebSocket text frames (M4/M6), so publishing
+    /// the same oversized content is rejected consistently regardless of
+    /// transport. Default matches M0's original hardcoded HTTP body limit
+    /// (1 MiB) — well above ntfy's `DefaultMessageSizeLimit` of 4096 bytes
+    /// (which exists to fit FCM/APNS push payloads, a constraint this
+    /// project doesn't have) and above M5's 256 KiB e2e-ciphertext cap.
+    #[arg(long, default_value_t = 1024 * 1024)]
+    pub max_message_bytes: u64,
+
+    /// Max distinct topics the server will create via `get_or_create`
+    /// before refusing new ones (existing topics are never blocked).
+    /// Protects against unbounded topic-name abuse. Scaled down from
+    /// ntfy.sh's own `DefaultTotalTopicLimit = 15000` (a multi-tenant
+    /// public-instance number) to a more conservative default for a
+    /// typical single-node/self-hosted deployment of this project.
+    #[arg(long, default_value_t = 1000)]
+    pub max_topics: usize,
+
+    /// Max concurrent subscriber connections (any of `/json`/`/sse`/`/raw`/
+    /// `/ws`/`/bus`) on a single topic.
+    #[arg(long, default_value_t = 1000)]
+    pub max_subscribers_per_topic: u64,
+
+    /// Max concurrent subscriber connections across the whole server (all
+    /// topics combined) — a global soft cap layered on top of the
+    /// per-topic cap, per PLAN.md M6 guidance ("a per-topic cap composed
+    /// into a global soft cap is reasonable").
+    #[arg(long, default_value_t = 10_000)]
+    pub max_subscribers_total: u64,
+
+    /// Max concurrent `/bus` (full-duplex chat) participants on a single
+    /// topic — tighter than the generic subscriber cap since a "chat room"
+    /// with thousands of full-duplex participants is a different (and
+    /// much rarer/heavier) use case than thousands of passive readers.
+    #[arg(long, default_value_t = 200)]
+    pub max_bus_participants_per_topic: u64,
+
+    /// Bounded grace period for graceful shutdown: after SIGINT/SIGTERM,
+    /// the server stops accepting new connections and gives existing
+    /// streams/WS connections this long to drain before forcing exit.
+    #[arg(long, default_value_t = 10)]
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for Config {
@@ -52,6 +107,13 @@ impl Default for Config {
             cache_size: 1024 * 1024 * 1024,
             cache_count: 10_000,
             default_access: DefaultAccess::ReadWrite,
+            publish_rate_limit: 60,
+            max_message_bytes: 1024 * 1024,
+            max_topics: 1000,
+            max_subscribers_per_topic: 1000,
+            max_subscribers_total: 10_000,
+            max_bus_participants_per_topic: 200,
+            shutdown_grace_secs: 10,
         }
     }
 }

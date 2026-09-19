@@ -73,10 +73,39 @@ pub async fn bus_ws(
     // defaults to `SinceMarker::None` when `since=` is absent.
     let since = params::parse_since(&headers, &query, false)?;
     let sender_label = resolve_sender_label(&headers, &query, &visitor);
+    let rate_key = crate::auth::RateKey::for_visitor(&visitor, addr.ip());
 
-    let topic = state.topics.get_or_create(&topic_name);
+    // M6: topic-count cap, then per-topic subscriber/bus-participant caps
+    // — all checked *before* upgrading, so a capacity rejection is a clean
+    // HTTP 429 rather than a WS connection that gets immediately dropped.
+    let topic = state.topics.get_or_create(&topic_name)?;
+    if !topic.subscriber_capacity_available() {
+        return Err(AppError::TooManyRequests(format!(
+            "topic '{topic_name}' has reached its subscriber capacity"
+        )));
+    }
+    if !topic.bus_capacity_available() {
+        return Err(AppError::TooManyRequests(format!(
+            "topic '{topic_name}' has reached its /bus participant capacity"
+        )));
+    }
 
-    Ok(ws.on_upgrade(move |socket| run_bus(socket, topic, topic_name, since, sender_label, can_write)))
+    let max_message_bytes = state.max_message_bytes;
+    let publish_limiter = state.publish_limiter.clone();
+
+    Ok(ws.on_upgrade(move |socket| {
+        run_bus(
+            socket,
+            topic,
+            topic_name,
+            since,
+            sender_label,
+            can_write,
+            max_message_bytes,
+            publish_limiter,
+            rate_key,
+        )
+    }))
 }
 
 /// Resolves the client's "sender" label (PLAN.md 4.1's opaque
@@ -121,6 +150,7 @@ struct RawControlFrame {
 /// Drives one `/bus` connection end to end: `open` -> backlog replay ->
 /// `presence` -> `bus_join` (which broadcasts `join`) -> read/write loop
 /// -> `bus_leave` (which broadcasts `leave`) on disconnect.
+#[allow(clippy::too_many_arguments)]
 async fn run_bus(
     mut socket: WebSocket,
     topic: Arc<Topic>,
@@ -128,6 +158,9 @@ async fn run_bus(
     since: SinceMarker,
     sender_label: String,
     can_write: bool,
+    max_message_bytes: u64,
+    publish_limiter: Arc<crate::auth::PublishLimiter>,
+    rate_key: crate::auth::RateKey,
 ) {
     if send_envelope(&mut socket, &Envelope::open(topic_name.clone())).await.is_err() {
         return;
@@ -175,7 +208,33 @@ async fn run_bus(
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        handle_incoming_text(&mut socket, &topic, &topic_name, &session_id, can_write, &text).await;
+                        // M6: cap incoming WS text frame size to the same
+                        // `max_message_bytes` limit the HTTP publish path
+                        // enforces via `DefaultBodyLimit`, so publishing
+                        // oversized content is rejected consistently
+                        // regardless of transport. Rejected with an
+                        // `error` control frame, not a disconnect (same
+                        // policy as every other malformed/denied frame).
+                        if text.len() as u64 > max_message_bytes {
+                            send_error(
+                                &mut socket,
+                                &topic_name,
+                                &format!("message exceeds max size of {max_message_bytes} bytes"),
+                            )
+                            .await;
+                            continue;
+                        }
+                        handle_incoming_text(
+                            &mut socket,
+                            &topic,
+                            &topic_name,
+                            &session_id,
+                            can_write,
+                            &text,
+                            &publish_limiter,
+                            &rate_key,
+                        )
+                        .await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => continue, // binary/ping/pong WS frames: app-level ping is a control frame, not a WS ping
@@ -191,6 +250,7 @@ async fn run_bus(
 /// Parses and dispatches one incoming client text frame. Never causes the
 /// connection to drop — malformed/unsupported/permission-denied frames all
 /// just get an `error` control frame written back.
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming_text(
     socket: &mut WebSocket,
     topic: &Arc<Topic>,
@@ -198,6 +258,8 @@ async fn handle_incoming_text(
     session_id: &str,
     can_write: bool,
     text: &str,
+    publish_limiter: &crate::auth::PublishLimiter,
+    rate_key: &crate::auth::RateKey,
 ) {
     let frame: IncomingFrame = match serde_json::from_str(text) {
         Ok(f) => f,
@@ -233,6 +295,14 @@ async fn handle_incoming_text(
         Some("message") | None => {
             if !can_write {
                 send_error(socket, topic_name, "permission denied: read-only participant").await;
+                return;
+            }
+            // M6: same per-visitor publish rate limit as the HTTP publish
+            // path, keyed on the same `RateKey` computed once at connect
+            // time (so a bus session's messages share one budget with any
+            // HTTP publishes from the same user/IP).
+            if !publish_limiter.check(rate_key.clone()) {
+                send_error(socket, topic_name, "publish rate limit exceeded, slow down").await;
                 return;
             }
             let priority = match frame.priority {

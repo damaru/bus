@@ -65,28 +65,123 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let store = Arc::new(Store::open(&config.data_dir)?);
     let cache = Arc::new(store.cache());
-    let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache.clone()));
+    let topic_limits = topic::TopicLimits {
+        max_topics: config.max_topics,
+        max_subscribers_per_topic: config.max_subscribers_per_topic,
+        max_subscribers_total: config.max_subscribers_total,
+        max_bus_participants_per_topic: config.max_bus_participants_per_topic,
+    };
+    let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache.clone(), topic_limits));
     let users = Arc::new(store.users());
     let acl = Arc::new(store.acl());
     let auth_limiter = Arc::new(auth::AuthLimiter::new());
+    let publish_limiter = Arc::new(auth::PublishLimiter::new(config.publish_rate_limit));
 
     spawn_retention_sweep(cache.clone(), config.cache_duration, config.cache_count, config.cache_size);
 
     let state = http::AppState {
-        store,
-        topics,
+        store: store.clone(),
+        topics: topics.clone(),
         users,
         acl,
         auth_limiter,
+        publish_limiter,
         default_access: config.default_access,
+        max_message_bytes: config.max_message_bytes,
     };
     let app = http::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+
+    let shutdown_grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
+
+    // Graceful shutdown (M6) is split into two distinct waits, since they
+    // have very different expected durations:
+    //   1. Waiting for SIGINT/SIGTERM is *unbounded* — that's just the
+    //      server running normally, for however long the operator wants.
+    //   2. Waiting for in-flight connections to drain, *after* the signal
+    //      arrives, must be *bounded* (a "reasonable grace period"), or a
+    //      client that never closes its stream would hang the process
+    //      forever.
+    // A single `tokio::time::timeout` around the whole `axum::serve(...)`
+    // future would incorrectly start counting from process start, not
+    // from when a shutdown was actually requested — so instead, the serve
+    // future is driven by a separate task, and the bounded timeout only
+    // wraps waiting on *that task's completion*, starting only after the
+    // signal has already been received.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut serve_task = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    wait_for_shutdown_signal().await;
+    tracing::info!("shutdown signal received, broadcasting close to active /bus participants");
+    topics.broadcast_shutdown_close();
+    // Tell axum to stop accepting new connections and start draining
+    // existing ones; ignore the error if the serve task already exited.
+    let _ = shutdown_tx.send(());
+
+    // `tokio::select!` (rather than `tokio::time::timeout`) so that on a
+    // timeout we still hold the `JoinHandle` and can `.abort()` it —
+    // `timeout()` would drop the handle without aborting the task,
+    // leaving the listener/connections to be torn down only implicitly
+    // (and only eventually) by process exit.
+    tokio::select! {
+        result = &mut serve_task => {
+            match result {
+                Ok(Ok(())) => tracing::info!("server shut down gracefully"),
+                Ok(Err(e)) => tracing::error!(error = %e, "server error during shutdown"),
+                Err(join_err) => tracing::error!(error = %join_err, "server task panicked during shutdown"),
+            }
+        }
+        _ = tokio::time::sleep(shutdown_grace) => {
+            tracing::warn!(
+                grace_secs = config.shutdown_grace_secs,
+                "graceful shutdown grace period elapsed, forcing remaining connections closed"
+            );
+            serve_task.abort();
+        }
+    }
+
+    // Flush sled before exiting so any buffered writes are durable on
+    // disk, not just in the shared page cache — cheap and quick even if
+    // periodic/Drop-time flushing would eventually do the same.
+    if let Err(e) = tokio::task::spawn_blocking(move || store.db.flush()).await {
+        tracing::warn!(error = %e, "sled flush task panicked during shutdown");
+    }
 
     Ok(())
+}
+
+/// Resolves once SIGINT (Ctrl+C) or SIGTERM is received. Deliberately just
+/// the signal wait — broadcasting the `close` control message and
+/// triggering axum's graceful shutdown both happen in `serve()`, right
+/// after this returns, so the *bounded* grace-period timeout in `serve()`
+/// only starts counting from here, not from process start.
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT, starting graceful shutdown"),
+        _ = terminate => tracing::info!("received SIGTERM, starting graceful shutdown"),
+    }
 }
 
 /// Periodically prunes every known topic's persisted message tree against

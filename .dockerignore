@@ -1,0 +1,11 @@
+target/
+.git/
+.gitignore
+refs/
+*.md
+Dockerfile
+.dockerignore
+.dhee/
+/tmp/
+/data/
+*.log

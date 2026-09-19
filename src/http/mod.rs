@@ -7,7 +7,7 @@ use axum::routing::get;
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::AuthLimiter;
+use crate::auth::{AuthLimiter, PublishLimiter};
 use crate::config::DefaultAccess;
 use crate::store::acl::Acl;
 use crate::store::users::Users;
@@ -28,19 +28,25 @@ pub struct AppState {
     pub users: Arc<Users>,
     pub acl: Arc<Acl>,
     pub auth_limiter: Arc<AuthLimiter>,
+    /// Per-visitor publish rate limiter (M6) — see `auth::PublishLimiter`.
+    pub publish_limiter: Arc<PublishLimiter>,
     /// Server-wide fallback permission applied when no explicit ACL entry
     /// matches a (principal, topic) pair (M0's `Config::default_access`,
     /// threaded through so `Acl::resolve` calls don't need to rebuild it).
     pub default_access: DefaultAccess,
+    /// Max size (bytes) of a single published message (M6's
+    /// `Config::max_message_bytes`) — drives both the axum
+    /// `DefaultBodyLimit` layer below (HTTP publish) and the `/bus`
+    /// WebSocket text-frame size check (`http::bus`), so both transports
+    /// enforce the exact same limit.
+    pub max_message_bytes: u64,
 }
-
-/// Maximum request body size accepted by any handler (1 MiB for M0/M1).
-const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Builds the top-level axum `Router`: `/health`, the ntfy-compatible
 /// publish/subscribe surface (PLAN.md 5.1), plus tracing and
 /// body-size-limit middleware. The `/bus` extension is wired in during M4.
 pub fn router(state: AppState) -> Router {
+    let body_limit = state.max_message_bytes as usize;
     Router::new()
         .route("/health", get(health))
         .route(
@@ -52,7 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/:topic/raw", get(subscribe::subscribe_raw))
         .route("/:topic/ws", get(subscribe::subscribe_ws))
         .route("/:topic/bus", get(bus::bus_ws))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
