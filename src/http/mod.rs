@@ -14,6 +14,7 @@ use crate::store::users::Users;
 use crate::store::Store;
 use crate::topic::TopicRegistry;
 
+pub mod attachment;
 pub mod bus;
 pub mod params;
 pub mod publish;
@@ -40,6 +41,21 @@ pub struct AppState {
     /// WebSocket text-frame size check (`http::bus`), so both transports
     /// enforce the exact same limit.
     pub max_message_bytes: u64,
+    /// Attachment blob store, present only when the server was started
+    /// with both `--attachment-dir` and `--base-url` set (see
+    /// `Config::validate`). `None` disables `/file/:id` downloads and the
+    /// (future) upload path entirely.
+    pub attachments: Option<Arc<crate::store::attachments::Attachments>>,
+    /// Public base URL (`Config::base_url`), used by the publish handler
+    /// to build absolute `/file/:id` download URLs for newly uploaded
+    /// attachments. Always `Some` together with `attachments` (both are
+    /// gated by the same `Config::validate` pairing check), but kept as
+    /// its own `Option` here to avoid re-deriving it from `attachments`.
+    pub base_url: Option<String>,
+    /// How long an uploaded attachment is retained before being reclaimed
+    /// (`Config::attachment_expiry`) — used by the publish handler to
+    /// stamp new attachments' `expires` field.
+    pub attachment_expiry: std::time::Duration,
 }
 
 /// Builds the top-level axum `Router`: `/health`, the ntfy-compatible
@@ -49,6 +65,10 @@ pub fn router(state: AppState) -> Router {
     let body_limit = state.max_message_bytes as usize;
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/file/:id",
+            axum::routing::get(attachment::download).head(attachment::download),
+        )
         .route(
             "/:topic",
             axum::routing::post(publish::publish).put(publish::publish),

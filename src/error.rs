@@ -19,6 +19,7 @@ pub enum AppError {
     Unauthorized(String),
     Forbidden(String),
     TooManyRequests(String),
+    PayloadTooLarge(String),
     Internal(String),
 }
 
@@ -30,6 +31,7 @@ impl AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 40100, msg.as_str()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, 40300, msg.as_str()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, 42900, msg.as_str()),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, 41301, msg.as_str()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, 50000, msg.as_str()),
         }
     }

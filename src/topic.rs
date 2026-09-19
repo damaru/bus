@@ -174,13 +174,12 @@ impl Topic {
     /// the calling (async handler) task rather than via `spawn_blocking` —
     /// only the periodic retention sweep, which scans whole topic trees,
     /// is moved onto a blocking task (see `main.rs`).
-    pub fn publish<F>(&self, build: F) -> Result<Envelope>
+    pub fn publish_with_id<F>(&self, id: String, build: F) -> Result<Envelope>
     where
         F: FnOnce(u64, String, i64) -> Envelope,
     {
         let seq = self.cache.next_seq(&self.name)?;
         self.seq.store(seq, Ordering::SeqCst);
-        let id = generate_message_id();
         let time = now_unix();
         let envelope = build(seq, id, time);
 
@@ -196,6 +195,15 @@ impl Topic {
 
         self.fan_out(&envelope);
         Ok(envelope)
+    }
+
+    /// Same as [`Topic::publish_with_id`] but generates a fresh message id
+    /// internally.
+    pub fn publish<F>(&self, build: F) -> Result<Envelope>
+    where
+        F: FnOnce(u64, String, i64) -> Envelope,
+    {
+        self.publish_with_id(generate_message_id(), build)
     }
 
     /// Sends `envelope` to every live subscriber's channel except

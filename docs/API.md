@@ -6,6 +6,7 @@ for installation/configuration; this document covers wire formats and behavior o
 - [Message envelope](#message-envelope)
 - [Publishing](#publishing)
 - [Subscribing](#subscribing)
+- [Attachments](#attachments)
 - [Auth & ACL](#auth--acl)
 - [Admin CLI](#admin-cli)
 - [Bus extension (`/bus`)](#bus-extension-bus)
@@ -37,6 +38,7 @@ shape:
 | `content_type` | string | the **only** value this server ever sets is `"text/markdown"` (via the markdown alias/flag); omitted otherwise, which implies plain text | `"text/markdown"` |
 | `encoding` | string | only if supplied at publish time; the value `"e2e"` (case-insensitive) triggers shape validation (see [E2E envelope](#e2e-envelope)) — any other value is stored/relayed as opaque text with no validation at all | `"e2e"` |
 | `enc` | object `{alg, kid, nonce}` (all strings) | only present when supplied at publish time, normally alongside `encoding: "e2e"` | `{"alg":"xchacha20poly1305","kid":"topic-key-v1","nonce":"Ey2Md4djKesJXxf+NKvRBrRsqj6tHjmF"}` |
+| `attachment` | object `{name, type?, size?, expires?, url}` | only when the message was published with a `filename=`/`attach=` param (see [Attachments](#attachments)) | `{"name":"photo.jpg","type":"image/jpeg","size":34823,"expires":1700010800,"url":"http://127.0.0.1:8080/file/X70jZcaQM3jd"}` |
 | `control` | object `{type, from, data?}` | only when `event == "control"` | `{"type":"join","from":"alice"}` |
 
 ### Event values
@@ -245,6 +247,102 @@ websocat "ws://localhost:8080/alerts/ws?poll=true&since=all"
 {"id":"N3TUB1xu06ml","seq":0,"time":1700000000,"event":"open","topic":"alerts"}
 ```
 *(only sent when `poll` is not set — omitted here since the example uses `poll=true`)*
+
+## Attachments
+
+A published message can carry a **local file upload** or a **remote URL** as an
+attachment. This is disabled by default — both `--attachment-dir` and `--base-url` must be
+set on `bus serve` to enable it (setting only one is a startup error; see the
+[README's configuration table](../README.md#configuration)). If disabled, publishing with
+`filename=`/`attach=` returns `400`.
+
+### Local file upload
+
+Same `PUT`/`POST /{topic}` endpoint as a normal publish, but the **raw request body is the
+file's bytes** (not message text) whenever a filename is supplied via header or query
+param:
+
+| Field | Header/query names |
+|---|---|
+| Filename | `X-Filename`, `filename`, `file`, `f` |
+
+```bash
+curl -T photo.jpg "http://127.0.0.1:8080/mytopic?filename=photo.jpg"
+```
+
+Equivalent using the header form (the pattern an `ntfy publish -f photo.jpg <url>`-style
+client would send — a raw `PUT`/`POST` body plus an `X-Filename` header instead of a query
+param):
+
+```bash
+curl -X POST --data-binary @photo.jpg -H "X-Filename: photo.jpg" http://127.0.0.1:8080/mytopic
+```
+
+If no other message text is supplied (via body text, `message=`, JSON `message`, etc. —
+not applicable here since the body *is* the file), the stored `message` defaults to
+`"You received a file: photo.jpg"`. The stored/broadcast envelope gains an `attachment`
+object (MIME type guessed from the filename's extension; `size` in bytes; `expires` as a
+unix-seconds timestamp `--attachment-expiry` in the future; `url` built from `--base-url`):
+
+```json
+{"id":"X70jZcaQM3jd","seq":4,"time":1700000000,"event":"message","topic":"mytopic","message":"You received a file: photo.jpg","attachment":{"name":"photo.jpg","type":"image/jpeg","size":34823,"expires":1700010800,"url":"http://127.0.0.1:8080/file/X70jZcaQM3jd"}}
+```
+
+Rejected with `413` if the upload exceeds `--attachment-file-size-limit` (per-file cap) or
+would push the server's total stored-attachment size over `--attachment-total-size-limit`
+(shared budget across every attachment currently on disk, freed as attachments expire or
+their messages age out of the cache).
+
+### `GET /file/{id}` / `HEAD /file/{id}`
+
+Downloads a previously uploaded attachment (`{id}` is the publish response's `id` field;
+an optional trailing extension, e.g. `/file/X70jZcaQM3jd.jpg`, is accepted and ignored for
+lookup purposes). `HEAD` returns the same `Content-Type`/`Content-Disposition`/
+`Content-Length` headers with no body — useful for checking existence/size before
+downloading. Returns `404` for a malformed id, an id that was never issued, or an
+attachment whose `--attachment-expiry` has passed (checked lazily on every request, not
+just by the periodic background sweep — so it 404s immediately once expired, even if the
+sweep hasn't run yet).
+
+**No ACL/permission check is performed on this endpoint** — this is a deliberate,
+documented design choice matching upstream ntfy, not an oversight: the download URL
+carries no topic context at all, so the only thing protecting an attachment is its
+12-character unguessable id (see [Message envelope](#message-envelope)). Anyone who
+obtains (or guesses) the id can download the file regardless of their read permission on
+the topic it was published to. Don't rely on `--default-access deny-all` or a topic ACL to
+keep an uploaded file private.
+
+### Remote URL attachment
+
+Attach a link to an externally-hosted file instead of uploading bytes through this server:
+
+| Field | Header/query names |
+|---|---|
+| Remote attachment URL | `X-Attach`, `attach`, `a` |
+
+```bash
+curl -X POST "http://127.0.0.1:8080/mytopic" -H "X-Attach: https://example.com/file.pdf"
+```
+
+```json
+{"id":"cHn6BFIcqZmW","seq":5,"time":1700000000,"event":"message","topic":"mytopic","message":"triggered","attachment":{"name":"file.pdf","url":"https://example.com/file.pdf"}}
+```
+
+No bytes are uploaded through the server, so neither `--attachment-file-size-limit` nor
+`--attachment-total-size-limit` applies to this form, and `type`/`size`/`expires` are
+omitted (the server never fetches or inspects the remote URL — `expires` stays unset since
+there is no local copy for this server to reclaim). If both `filename=` and `attach=` are
+supplied on the same request, `attach=` wins and the request body is treated as ordinary
+message text rather than a file upload.
+
+### Expiry vs. message retention
+
+Attachments expire independently of, and typically sooner than, the message cache:
+`--attachment-expiry` defaults to `3h` while `--cache-duration` defaults to `12h`. Once an
+attachment expires, `GET`/`HEAD /file/{id}` starts returning `404`, but the message
+envelope itself (including its now-broken `attachment.url`) remains retrievable via
+`/json`/`/sse`/`/raw`/`/ws` until the normal cache retention (`--cache-duration`/
+`--cache-count`/`--cache-size`) eventually removes the message too.
 
 ## Auth & ACL
 
@@ -534,8 +632,9 @@ Every error response constructed by this server's handlers is a JSON body:
 | `BadRequest` | 400 | 40000 |
 | `Unauthorized` | 401 | 40100 |
 | `Forbidden` | 403 | 40300 |
-| `NotFound` | 404 | 40400 *(defined but never constructed by any handler in this server today — see below)* |
+| `NotFound` | 404 | 40400 — used by `GET`/`HEAD /file/{id}` (see [Attachments](#attachments)) for a malformed/unknown/expired attachment id; no other handler in this server constructs it |
 | `TooManyRequests` | 429 | 42900 |
+| `PayloadTooLarge` | 413 | 41301 — used only for attachment size limits (see [Attachments](#attachments)); see the note below for the *other* kind of 413 this server can return |
 | `Internal` | 500 | 50000 |
 
 ```json
@@ -551,19 +650,33 @@ Every error response constructed by this server's handlers is a JSON body:
 {"code":40300,"http":403,"error":"no Write access to topic 'secrettopic'"}
 ```
 ```json
+// 404 — unknown/expired attachment id
+{"code":40400,"http":404,"error":"attachment not found"}
+```
+```json
+// 413 — attachment exceeds --attachment-file-size-limit or --attachment-total-size-limit
+{"code":41301,"http":413,"error":"attachment exceeds the server's file size limit"}
+```
+```json
 // 429 — publish rate limit exceeded
 {"code":42900,"http":429,"error":"publish rate limit exceeded, slow down"}
 ```
 
-**413 is not this server's own JSON shape.** An oversized request body is rejected by
-axum's `DefaultBodyLimit` middleware *before* any handler runs, so the body is axum's own
-plain-text response, not `{"code",...}`:
+**A plain, oversized publish body's 413 is *not* this server's own JSON shape.** That case
+is rejected by axum's `DefaultBodyLimit` middleware (governed by `--max-message-bytes`)
+*before* any handler runs, so the body is axum's own plain-text response, not
+`{"code",...}`:
 
 ```
 HTTP/1.1 413 Payload Too Large
 
 Failed to buffer the request body: length limit exceeded
 ```
+
+An **attachment** that exceeds `--attachment-file-size-limit` or
+`--attachment-total-size-limit` is a different case: the `publish` handler itself checks
+the size (after the body has already been buffered) and returns the JSON `PayloadTooLarge`
+shape shown above, not axum's plain-text response.
 
 **404 is also not always this server's shape.** A path that doesn't match any route at
 all gets axum's default empty-body `404`; a path that matches a route's shape but the

@@ -96,6 +96,31 @@ pub struct Config {
     /// streams/WS connections this long to drain before forcing exit.
     #[arg(long, default_value_t = 10)]
     pub shutdown_grace_secs: u64,
+
+    /// Directory to store uploaded file attachments. Attachments are disabled
+    /// unless both this and `base_url` are set.
+    #[arg(long)]
+    pub attachment_dir: Option<PathBuf>,
+
+    /// Public base URL clients use to reach this server (e.g.
+    /// "https://bus.example.com"), used to build attachment download URLs.
+    /// Attachments are disabled unless both this and `attachment_dir` are set.
+    #[arg(long)]
+    pub base_url: Option<String>,
+
+    /// Max size (bytes) of a single uploaded attachment.
+    #[arg(long, default_value_t = 15 * 1024 * 1024)]
+    pub attachment_file_size_limit: u64,
+
+    /// Max total size (bytes) of all stored attachments combined.
+    #[arg(long, default_value_t = 5 * 1024 * 1024 * 1024)]
+    pub attachment_total_size_limit: u64,
+
+    /// How long an uploaded attachment is retained before being reclaimed
+    /// (independent of, and typically shorter than, the message cache
+    /// retention duration).
+    #[arg(long, default_value = "3h", value_parser = parse_duration_str)]
+    pub attachment_expiry: std::time::Duration,
 }
 
 impl Default for Config {
@@ -114,7 +139,25 @@ impl Default for Config {
             max_subscribers_total: 10_000,
             max_bus_participants_per_topic: 200,
             shutdown_grace_secs: 10,
+            attachment_dir: None,
+            base_url: None,
+            attachment_file_size_limit: 15 * 1024 * 1024,
+            attachment_total_size_limit: 5 * 1024 * 1024 * 1024,
+            attachment_expiry: std::time::Duration::from_secs(3 * 3600),
         }
+    }
+}
+
+impl Config {
+    /// Fails fast if exactly one of `attachment_dir`/`base_url` is set
+    /// without the other — attachments require both or neither.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.attachment_dir.is_some() != self.base_url.is_some() {
+            anyhow::bail!(
+                "--attachment-dir and --base-url must both be set to enable attachments, or both left unset to disable them"
+            );
+        }
+        Ok(())
     }
 }
 

@@ -3,10 +3,12 @@
 use std::path::Path;
 
 pub mod acl;
+pub mod attachments;
 pub mod cache;
 pub mod users;
 
 use acl::Acl;
+use attachments::Attachments;
 use cache::Cache;
 use users::Users;
 
@@ -37,5 +39,12 @@ impl Store {
     /// Builds an [`Acl`] handle over this store's database.
     pub fn acl(&self) -> Acl {
         Acl::new(self.db.clone())
+    }
+
+    /// Builds an [`Attachments`] handle over this store's database,
+    /// rooted at `dir` on the filesystem. Returns an error if the
+    /// directory can't be created or the sled tree can't be opened.
+    pub fn attachments(&self, dir: std::path::PathBuf, file_size_limit: u64, total_size_limit: u64) -> anyhow::Result<Attachments> {
+        Attachments::open(self.db.clone(), dir, file_size_limit, total_size_limit)
     }
 }

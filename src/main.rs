@@ -9,6 +9,14 @@ use clap::{Parser, Subcommand};
 use bus::admin;
 use bus::config::Config;
 
+/// Cadence shared by both background sweeps: the message-cache retention
+/// pass (`spawn_retention_sweep`) and the attachment expiry pass
+/// (`spawn_attachment_expiry_sweep`). Only the expiry *threshold* differs
+/// per sweep (`cache_duration`/`cache_count`/`cache_size` vs
+/// `Config::attachment_expiry`) — there's no separate configurable
+/// interval for attachments.
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Debug, Parser)]
 #[command(name = "bus", about = "Minimal ntfy-compatible pub/sub server with a bidirectional bus extension")]
 struct Cli {
@@ -52,6 +60,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .init();
 
+    config.validate()?;
+
     tracing::info!(bind = %config.bind, data_dir = ?config.data_dir, "starting bus server");
 
     // Single source of truth for wiring store/topics/auth/etc together —
@@ -59,12 +69,22 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let state = bus::build_state(&config)?;
     let store = state.store.clone();
     let topics = state.topics.clone();
+    let attachments = state.attachments.clone();
     // Cache is cheap to re-derive from the store (just clones the sled::Db
     // handle) — used here only by the retention sweep, which isn't part of
     // `AppState` itself.
     let cache = Arc::new(store.cache());
 
-    spawn_retention_sweep(cache, config.cache_duration, config.cache_count, config.cache_size);
+    spawn_retention_sweep(
+        cache,
+        config.cache_duration,
+        config.cache_count,
+        config.cache_size,
+        attachments.clone(),
+    );
+    if let Some(a) = attachments.clone() {
+        spawn_attachment_expiry_sweep(a);
+    }
 
     let app = bus::http::router(state);
 
@@ -164,9 +184,17 @@ async fn wait_for_shutdown_signal() {
 /// Periodically prunes every known topic's persisted message tree against
 /// the configured `cache-duration`/`cache-count`/`cache-size` limits (best-
 /// effort for size; see `store::cache::Cache::prune`). Runs on a dedicated
-/// blocking task since a full retention pass scans whole topic trees.
-fn spawn_retention_sweep(cache: Arc<bus::store::cache::Cache>, max_age: std::time::Duration, max_count: u64, max_size_bytes: u64) {
-    const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// blocking task since a full retention pass scans whole topic trees. Any
+/// pruned entries that carried an attachment have their now-orphaned blob
+/// reclaimed too (via `attachments`, if attachments are enabled), since
+/// otherwise it would linger on disk until its own independent expiry.
+fn spawn_retention_sweep(
+    cache: Arc<bus::store::cache::Cache>,
+    max_age: std::time::Duration,
+    max_count: u64,
+    max_size_bytes: u64,
+    attachments: Option<Arc<bus::store::attachments::Attachments>>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         loop {
@@ -174,19 +202,58 @@ fn spawn_retention_sweep(cache: Arc<bus::store::cache::Cache>, max_age: std::tim
             let cache = cache.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let mut total_pruned = 0usize;
+                let mut all_orphaned_ids: Vec<String> = Vec::new();
                 for topic in cache.topics() {
                     match cache.prune(&topic, max_age, max_count, max_size_bytes) {
-                        Ok(n) => total_pruned += n,
+                        Ok(res) => {
+                            total_pruned += res.removed;
+                            all_orphaned_ids.extend(res.orphaned_attachment_ids);
+                        }
                         Err(e) => tracing::warn!(topic = %topic, error = %e, "retention sweep failed for topic"),
                     }
                 }
-                total_pruned
+                (total_pruned, all_orphaned_ids)
             })
             .await;
             match result {
-                Ok(n) if n > 0 => tracing::debug!(pruned = n, "retention sweep pruned expired/excess messages"),
-                Ok(_) => {}
+                Ok((n, orphaned_ids)) => {
+                    if n > 0 {
+                        tracing::debug!(pruned = n, "retention sweep pruned expired/excess messages");
+                    }
+                    if let Some(a) = &attachments {
+                        for id in orphaned_ids {
+                            if let Err(e) = a.delete(&id).await {
+                                tracing::warn!(id = %id, error = %e, "failed to delete orphaned attachment blob");
+                            }
+                        }
+                    }
+                }
                 Err(e) => tracing::warn!(error = %e, "retention sweep task panicked"),
+            }
+        }
+    });
+}
+
+/// Periodically reclaims attachment blobs whose `expires` timestamp has
+/// passed (independent of, and typically shorter than, the message cache
+/// retention duration — see `Config::attachment_expiry`). Pure async I/O
+/// (sled + filesystem, both already behind async fns), so this runs on
+/// the normal tokio runtime rather than `spawn_blocking`.
+fn spawn_attachment_expiry_sweep(attachments: Arc<bus::store::attachments::Attachments>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let expired = attachments.list_expired(bus::model::now_unix());
+            let mut deleted = 0usize;
+            for id in expired {
+                match attachments.delete(&id).await {
+                    Ok(()) => deleted += 1,
+                    Err(e) => tracing::warn!(id = %id, error = %e, "failed to delete expired attachment"),
+                }
+            }
+            if deleted > 0 {
+                tracing::debug!(deleted, "attachment expiry sweep deleted expired attachments");
             }
         }
     });

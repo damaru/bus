@@ -123,6 +123,21 @@ pub struct Enc {
     pub nonce: String,
 }
 
+/// A file/media attachment on an [`Envelope`] — either uploaded to the
+/// server (with `size`/`expires` populated) or a remote URL supplied by
+/// the publisher (both `None`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>, // MIME type, e.g. "image/png"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>, // bytes; None for remote-URL attachments
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires: Option<i64>, // unix seconds; None for remote-URL
+    pub url: String,
+}
+
 /// The message envelope: superset of ntfy's `model.Message`. See PLAN.md
 /// section 4.1 for the wire format this mirrors field-for-field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +175,10 @@ pub struct Envelope {
     /// `encoding == "e2e"` (M5). See [`Enc`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enc: Option<Enc>,
+    /// File/media attachment metadata, if the message has one attached.
+    /// See [`Attachment`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
     /// Bus control payload, present only when `event == Event::Control`
     /// (M4). `None`/omitted for every other event, preserving the M1-era
     /// JSON shape for plain ntfy-compatible clients.
@@ -202,6 +221,7 @@ impl Envelope {
             content_type,
             encoding,
             enc,
+            attachment: None,
             control: None,
         }
     }
@@ -268,6 +288,7 @@ impl Envelope {
             content_type: None,
             encoding: None,
             enc: None,
+            attachment: None,
             control: None,
         }
     }

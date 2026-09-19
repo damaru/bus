@@ -13,6 +13,7 @@ use serde::Deserialize;
 use crate::error::AppError;
 use crate::http::params;
 use crate::http::AppState;
+use crate::model;
 use crate::model::{Enc, Envelope};
 use crate::store::acl::Permission;
 
@@ -82,8 +83,14 @@ pub async fn publish(
     let mut priority: Option<u8> = None;
     let mut message_text: Option<String>;
     let (mut encoding, mut enc) = params::read_enc_params(&headers, &query);
+    let filename = params::read_param(&headers, &query, &["x-filename", "filename", "file", "f"]);
+    let attach_url = params::read_param(&headers, &query, &["x-attach", "attach", "a"]);
 
-    if is_json {
+    if filename.is_some() {
+        // Local file upload: the raw body bytes ARE the attachment
+        // content, not message text — skip UTF-8/JSON decoding entirely.
+        message_text = None;
+    } else if is_json {
         let parsed: JsonPublishBody =
             serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("invalid JSON body: {e}")))?;
         if title.is_none() {
@@ -144,37 +151,129 @@ pub async fn publish(
         None
     };
 
-    let message_text = message_text
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| EMPTY_MESSAGE_PLACEHOLDER.to_string());
+    let message_text = message_text.filter(|s| !s.is_empty());
 
     // Opt-in shape validation, only when encoding == "e2e" (PLAN.md 7).
     // Never decodes/inspects message/title content beyond a size cap.
-    params::validate_e2e(encoding.as_deref(), enc.as_ref(), Some(&message_text), title.as_deref())?;
+    params::validate_e2e(encoding.as_deref(), enc.as_ref(), message_text.as_deref(), title.as_deref())?;
+
+    // Attachment handling (remote URL vs local upload vs none) — see
+    // docs/plans/file-attachments.md section 5. Both branches are gated
+    // identically behind `state.attachments.is_some()` for a consistent
+    // mental model (recommendation adopted from the plan's open decision
+    // #1), even though the remote-URL branch itself writes no bytes to
+    // disk.
+    let attachment: Option<model::Attachment> = if let Some(url) = attach_url {
+        if state.attachments.is_none() {
+            return Err(AppError::BadRequest("attachments are not enabled on this server".to_string()));
+        }
+        Some(model::Attachment {
+            name: filename_from_url(&url),
+            r#type: None,
+            size: None,
+            expires: None,
+            url,
+        })
+    } else {
+        None
+    };
 
     let topic_ref = state.topics.get_or_create(&topic)?;
     let topic_name = topic.clone();
-    let envelope = topic_ref
-        .publish(move |seq, id, time| {
-            Envelope::new_message(
-                topic_name,
-                seq,
-                id,
-                time,
-                title,
-                Some(message_text),
-                priority,
-                tags,
-                click,
-                content_type,
-                encoding,
-                enc,
-                None,
-            )
-        })
-        .map_err(|e| AppError::Internal(format!("failed to persist message: {e}")))?;
+    let envelope = if let (Some(filename), None) = (&filename, &attachment) {
+        // Local file upload: filename set, no attach_url (attach_url
+        // takes precedence if somehow both are set — matches ntfy's
+        // dispatch order in handlePublishBody).
+        let attachments = state
+            .attachments
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("attachments are not enabled on this server".to_string()))?;
+
+        if body.len() as u64 > attachments.file_size_limit() {
+            return Err(AppError::PayloadTooLarge(
+                "attachment exceeds the server's file size limit".to_string(),
+            ));
+        }
+        if body.len() as u64 > attachments.remaining() {
+            return Err(AppError::PayloadTooLarge(
+                "attachment exceeds the server's remaining storage budget".to_string(),
+            ));
+        }
+
+        let id = model::generate_message_id();
+        let mime = crate::store::attachments::Attachments::mime_for_filename(filename);
+        let expires = model::now_unix() + state.attachment_expiry.as_secs() as i64;
+        let base_url = state.base_url.clone().unwrap_or_default();
+        let attachment_meta = model::Attachment {
+            name: filename.clone(),
+            r#type: Some(mime),
+            size: Some(body.len() as u64),
+            expires: Some(expires),
+            url: format!("{}/file/{}", base_url.trim_end_matches('/'), id),
+        };
+
+        attachments
+            .write(&id, &body, attachment_meta.clone())
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to store attachment: {e}")))?;
+
+        let message_text = message_text.unwrap_or_else(|| format!("You received a file: {filename}"));
+
+        topic_ref
+            .publish_with_id(id, move |seq, id, time| {
+                let mut env = Envelope::new_message(
+                    topic_name,
+                    seq,
+                    id,
+                    time,
+                    title,
+                    Some(message_text),
+                    priority,
+                    tags,
+                    click,
+                    content_type,
+                    encoding,
+                    enc,
+                    None,
+                );
+                env.attachment = Some(attachment_meta);
+                env
+            })
+            .map_err(|e| AppError::Internal(format!("failed to persist message: {e}")))?
+    } else {
+        let message_text = message_text.unwrap_or_else(|| EMPTY_MESSAGE_PLACEHOLDER.to_string());
+
+        topic_ref
+            .publish(move |seq, id, time| {
+                let mut env = Envelope::new_message(
+                    topic_name,
+                    seq,
+                    id,
+                    time,
+                    title,
+                    Some(message_text),
+                    priority,
+                    tags,
+                    click,
+                    content_type,
+                    encoding,
+                    enc,
+                    None,
+                );
+                env.attachment = attachment;
+                env
+            })
+            .map_err(|e| AppError::Internal(format!("failed to persist message: {e}")))?
+    };
 
     Ok(Json(envelope))
+}
+
+/// Best-effort filename from the last path segment of a URL, falling back
+/// to a generic name — used to label remote (`attach=`) attachments for
+/// display, matching ntfy's own fallback behavior.
+fn filename_from_url(url: &str) -> String {
+    url.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("attachment").to_string()
 }
 
 /// Accepts either a JSON number (`1`..`5`) or a priority alias string, per
@@ -185,6 +284,7 @@ fn parse_priority_value(v: &serde_json::Value) -> Result<u8, AppError> {
             let p = n
                 .as_u64()
                 .ok_or_else(|| AppError::BadRequest("invalid priority".to_string()))?;
+
             if (1..=5).contains(&p) {
                 Ok(p as u8)
             } else {

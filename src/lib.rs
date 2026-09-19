@@ -37,6 +37,15 @@ pub fn build_state(config: &Config) -> anyhow::Result<http::AppState> {
     let auth_limiter = Arc::new(auth::AuthLimiter::new());
     let publish_limiter = Arc::new(auth::PublishLimiter::new(config.publish_rate_limit));
 
+    let attachments = match &config.attachment_dir {
+        Some(dir) if config.base_url.is_some() => Some(Arc::new(store.attachments(
+            dir.clone(),
+            config.attachment_file_size_limit,
+            config.attachment_total_size_limit,
+        )?)),
+        _ => None,
+    };
+
     Ok(http::AppState {
         store,
         topics,
@@ -46,6 +55,9 @@ pub fn build_state(config: &Config) -> anyhow::Result<http::AppState> {
         publish_limiter,
         default_access: config.default_access,
         max_message_bytes: config.max_message_bytes,
+        attachments,
+        base_url: config.base_url.clone(),
+        attachment_expiry: config.attachment_expiry,
     })
 }
 

@@ -41,6 +41,16 @@ struct TopicMeta {
     last_access: i64,
 }
 
+/// Outcome of a single [`Cache::prune`] call: how many entries were
+/// removed, and the message ids of any removed entries that carried an
+/// attachment (so the caller — `main.rs`'s sweep — can also reclaim the
+/// now-orphaned attachment blob, which would otherwise linger until its
+/// own independent expiry).
+pub struct PruneResult {
+    pub removed: usize,
+    pub orphaned_attachment_ids: Vec<String>,
+}
+
 /// sled-backed message cache: persistence, `since=` replay, and retention.
 pub struct Cache {
     db: sled::Db,
@@ -159,8 +169,9 @@ impl Cache {
 
     /// Deletes the oldest entries in `topic`'s message tree once the
     /// `max_age`/`max_count`/`max_size_bytes` limits are exceeded, in that
-    /// order (age first, then count, then approximate size). Returns the
-    /// number of entries removed.
+    /// order (age first, then count, then approximate size). Returns a
+    /// [`PruneResult`]: the number of entries removed, plus the message
+    /// ids of any removed entries that carried an attachment.
     ///
     /// `max_size_bytes` enforcement is best-effort per PLAN.md section 8:
     /// after age/count pruning it trims further, oldest-first, until the
@@ -168,7 +179,7 @@ impl Cache {
     /// the cap. This is exact (not averaged) since we already have every
     /// entry's byte length in hand from the scan, but it's still a
     /// secondary limit — cache-duration and cache-count are primary.
-    pub fn prune(&self, topic: &str, max_age: Duration, max_count: u64, max_size_bytes: u64) -> Result<usize> {
+    pub fn prune(&self, topic: &str, max_age: Duration, max_count: u64, max_size_bytes: u64) -> Result<PruneResult> {
         let tree = self.msgs_tree(topic)?;
         let cutoff = model::now_unix() - max_age.as_secs() as i64;
 
@@ -180,35 +191,49 @@ impl Cache {
         }
 
         let mut removed = 0usize;
-        let mut kept: Vec<(sled::IVec, usize)> = Vec::with_capacity(entries.len());
+        let mut orphaned_attachment_ids: Vec<String> = Vec::new();
+        let mut kept: Vec<(sled::IVec, usize, Option<String>)> = Vec::with_capacity(entries.len());
         for (key, envelope, size) in entries {
             if envelope.time < cutoff {
                 tree.remove(&key).context("removing expired message")?;
                 removed += 1;
+                if envelope.attachment.is_some() {
+                    orphaned_attachment_ids.push(envelope.id.clone());
+                }
             } else {
-                kept.push((key, size));
+                let attachment_id = envelope.attachment.is_some().then(|| envelope.id.clone());
+                kept.push((key, size, attachment_id));
             }
         }
 
         if kept.len() as u64 > max_count {
             let excess = kept.len() as u64 - max_count;
-            for (key, _) in kept.drain(..excess as usize) {
+            for (key, _, attachment_id) in kept.drain(..excess as usize) {
                 tree.remove(&key).context("removing excess message")?;
                 removed += 1;
+                if let Some(id) = attachment_id {
+                    orphaned_attachment_ids.push(id);
+                }
             }
         }
 
-        let mut total_size: u64 = kept.iter().map(|(_, size)| *size as u64).sum();
+        let mut total_size: u64 = kept.iter().map(|(_, size, _)| *size as u64).sum();
         let mut idx = 0;
         while total_size > max_size_bytes && idx < kept.len() {
-            let (key, size) = &kept[idx];
+            let (key, size, attachment_id) = &kept[idx];
             tree.remove(key).context("removing oversized-cache message")?;
             total_size = total_size.saturating_sub(*size as u64);
             removed += 1;
+            if let Some(id) = attachment_id {
+                orphaned_attachment_ids.push(id.clone());
+            }
             idx += 1;
         }
 
-        Ok(removed)
+        Ok(PruneResult {
+            removed,
+            orphaned_attachment_ids,
+        })
     }
 
     /// Lists every topic that has at least one persisted message tree
@@ -282,7 +307,8 @@ mod tests {
 
         let removed = cache
             .prune("agetopic", Duration::from_secs(3600), u64::MAX, u64::MAX)
-            .unwrap();
+            .unwrap()
+            .removed;
         assert_eq!(removed, 1, "only the 2h-old message should be pruned by a 1h max_age");
 
         let remaining = cache.messages_since("agetopic", &SinceMarker::All).unwrap();
@@ -299,7 +325,7 @@ mod tests {
             cache.store_message("counttopic", &envelope_at("counttopic", seq, now)).unwrap();
         }
 
-        let removed = cache.prune("counttopic", Duration::from_secs(86_400), 3, u64::MAX).unwrap();
+        let removed = cache.prune("counttopic", Duration::from_secs(86_400), 3, u64::MAX).unwrap().removed;
         assert_eq!(removed, 2, "5 entries capped to max_count=3 should remove the oldest 2");
 
         let remaining = cache.messages_since("counttopic", &SinceMarker::All).unwrap();
@@ -321,7 +347,7 @@ mod tests {
         // Cap sized for roughly 2 entries -- age/count limits left wide
         // open so only the size cap is exercised.
         let cap = (entry_size * 2 + entry_size / 2) as u64;
-        let removed = cache.prune("sizetopic", Duration::from_secs(86_400), u64::MAX, cap).unwrap();
+        let removed = cache.prune("sizetopic", Duration::from_secs(86_400), u64::MAX, cap).unwrap().removed;
         assert_eq!(removed, 3, "should trim oldest-first until under the size cap");
 
         let remaining = cache.messages_since("sizetopic", &SinceMarker::All).unwrap();
@@ -334,7 +360,7 @@ mod tests {
         let cache = temp_cache();
         let now = model::now_unix();
         cache.store_message("quiettopic", &envelope_at("quiettopic", 1, now)).unwrap();
-        let removed = cache.prune("quiettopic", Duration::from_secs(86_400), 100, u64::MAX).unwrap();
+        let removed = cache.prune("quiettopic", Duration::from_secs(86_400), 100, u64::MAX).unwrap().removed;
         assert_eq!(removed, 0);
     }
 }

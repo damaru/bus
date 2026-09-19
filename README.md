@@ -37,6 +37,8 @@ ntfy-style clients work unmodified against the read-only endpoints (`/json`, `/s
   grace period to drain before forcing exit.
 - `bus admin` CLI for user/token/ACL management directly against the sled database (no HTTP
   admin API).
+- Optional file attachments (local upload or remote URL) via `filename=`/`attach=` publish
+  params, served back at `GET /file/{id}` with independent expiry from the message cache.
 
 ## Quick start
 
@@ -93,6 +95,11 @@ All flags apply to `bus serve`. `bus admin ...` only takes `--data-dir` (see
 | `--max-subscribers-total` | `10000` | Max concurrent subscriber connections across the whole server (a global soft cap on top of the per-topic cap). |
 | `--max-bus-participants-per-topic` | `200` | Max concurrent `/bus` participants on a single topic. |
 | `--shutdown-grace-secs` | `10` | Bounded grace period after SIGINT/SIGTERM before forcing remaining connections closed. |
+| `--attachment-dir` | unset (disabled) | Directory to store uploaded file attachments. Must be set together with `--base-url` (or both left unset) to enable/disable the feature — setting only one is a startup error. |
+| `--base-url` | unset (disabled) | Public base URL clients use to reach this server (e.g. `https://bus.example.com`), used to build attachment download URLs. Must be set together with `--attachment-dir`. |
+| `--attachment-file-size-limit` | `15728640` (15 MiB) | Max size (bytes) of a single uploaded attachment. |
+| `--attachment-total-size-limit` | `5368709120` (5 GiB) | Max total size (bytes) of all stored attachments combined. |
+| `--attachment-expiry` | `3h` | How long an uploaded attachment is retained before being reclaimed (independent of, and typically shorter than, `--cache-duration`). |
 
 See [docs/API.md](docs/API.md) for the full HTTP/WebSocket API reference, including the
 message envelope format, every endpoint, auth/ACL semantics, the bus extension's control
@@ -101,7 +108,7 @@ messages, the E2E envelope, and exact error responses.
 ## Development
 
 ```bash
-cargo test      # unit tests (in-crate) + 5 integration test files under tests/
+cargo test      # unit tests (in-crate) + 6 integration test files under tests/
 cargo clippy
 ```
 
@@ -121,11 +128,13 @@ src/
     users.rs     user/token CRUD + argon2 verification
     acl.rs       permission lookup + default-access fallback + topic-pattern globbing
     cache.rs     message persistence, since= resolution, retention pruning
+    attachments.rs  attachment blob storage, size accounting, expiry listing
   http/
     mod.rs       axum Router assembly, shared AppState, permission enforcement
     publish.rs   PUT/POST /{topic}
     subscribe.rs /json, /sse, /raw, /ws (read-only)
     bus.rs       /{topic}/bus (full duplex + control messages)
+    attachment.rs  GET/HEAD /file/:id download handler
     params.rs    query/header parsing + aliasing, since= parsing, e2e shape validation
   admin/
     mod.rs       `bus admin user|token|acl ...` subcommands
@@ -136,4 +145,5 @@ tests/
   auth_acl.rs          allow/deny matrix, default-access modes
   bus_duplex.rs        two clients chat + presence join/leave over /bus
   e2e_envelope.rs      ciphertext passthrough byte-for-byte, filters no-op
+  attachments.rs       upload/download roundtrip, size limits, expiry, remote-URL passthrough
 ```
