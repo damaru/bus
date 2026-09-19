@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 
 use axum::http::{HeaderMap, Uri};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use base64::Engine;
 
 use crate::error::AppError;
-use crate::model::{self, Envelope, Event, SinceMarker};
+use crate::model::{self, Enc, Envelope, Event, SinceMarker};
 
 /// Parses a request's raw query string into a lowercased-key map. Matches
 /// ntfy's `readQueryParam`, which looks up `r.URL.Query().Get(strings.ToLower(name))` —
@@ -160,6 +162,16 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
 /// `message`/`message_delete`/`message_clear` events are filtered — control
 /// and lifecycle events (open/keepalive) always pass, matching ntfy's
 /// `queryFilter.Pass`.
+///
+/// **E2E note (PLAN.md section 7):** `message=`/`title=` are plain string
+/// equality checks against whatever is in the envelope's `message`/`title`
+/// fields. When `encoding == "e2e"`, those fields hold base64 ciphertext,
+/// so a plaintext filter value will (almost) never equal the ciphertext —
+/// these filters are simply **not meaningful** on e2e-encoded messages.
+/// This isn't a bug to fix: the server can't know the plaintext (it's a
+/// blind relay), so "no match" is the only honest outcome. No special-case
+/// code is needed here; it falls out of the existing plain-string-compare
+/// logic below.
 #[derive(Debug, Default, Clone)]
 pub struct QueryFilter {
     pub id: Option<String>,
@@ -220,4 +232,120 @@ pub fn parse_query_filters(headers: &HeaderMap, query: &HashMap<String, String>)
         tags,
         priority,
     })
+}
+
+/// Reads the `encoding`/`enc.{alg,kid,nonce}` header/query aliases for a
+/// publish request (PLAN.md section 4.1). Returns `(encoding, enc)` — `enc`
+/// is only `Some` if at least one of alg/kid/nonce was supplied via
+/// header/query (an incomplete triple is still returned as `Some` here so
+/// [`validate_e2e`] can produce a precise "which field is missing" error;
+/// this function itself does no validation).
+pub fn read_enc_params(headers: &HeaderMap, query: &HashMap<String, String>) -> (Option<String>, Option<Enc>) {
+    let encoding = read_param(headers, query, &["x-encoding", "encoding"]);
+    let alg = read_param(headers, query, &["x-enc-alg", "enc-alg"]);
+    let kid = read_param(headers, query, &["x-enc-kid", "enc-kid", "x-enc-key-id", "enc-key-id"]);
+    let nonce = read_param(headers, query, &["x-enc-nonce", "enc-nonce"]);
+    let enc = if alg.is_some() || kid.is_some() || nonce.is_some() {
+        Some(Enc {
+            alg: alg.unwrap_or_default(),
+            kid: kid.unwrap_or_default(),
+            nonce: nonce.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    (encoding, enc)
+}
+
+/// Max length (bytes) of `enc.alg`/`enc.kid`. These are short, opaque,
+/// client-defined identifiers (e.g. `"xchacha20poly1305"`, `"topic-key-v1"`)
+/// — 128 bytes is generous headroom for any real algorithm name or key-id
+/// scheme while still bounding abuse. PLAN.md section 7 asks for "length
+/// limits" but doesn't pin an exact number, so this is a documented
+/// milestone choice.
+pub const E2E_ALG_MAX_LEN: usize = 128;
+pub const E2E_KID_MAX_LEN: usize = 128;
+
+/// Max *decoded* length (bytes) of `enc.nonce`. Real AEAD nonces are tiny
+/// (12 bytes for AES-GCM, 24 for XChaCha20-Poly1305); 256 bytes is over 10x
+/// headroom for any conceivable algorithm's nonce while still rejecting
+/// abuse (e.g. someone stuffing large data into the "nonce" field).
+pub const E2E_NONCE_MAX_DECODED_LEN: usize = 256;
+
+/// Max length (bytes, as transmitted — i.e. base64 text length, not
+/// decoded) of an e2e-encoded `message`/`title` field. Chosen per the
+/// milestone's own suggestion (documented in PLAN.md M5 guidance as "e.g.
+/// 256KB"): comfortably larger than ntfy's plain-message default of 4096
+/// bytes (`refs/ntfy/server/config.go`'s `DefaultMessageSizeLimit`, chosen
+/// there to fit FCM/APNS push payloads — a constraint this project doesn't
+/// have, since it has no push-forwarding), while still well under the
+/// outer 1 MiB `DefaultBodyLimit` request-body cap from `http::mod`. This
+/// is a per-message content cap, not a request-size cap.
+pub const E2E_PAYLOAD_MAX_LEN: usize = 256 * 1024;
+
+/// Validates the **shape** of an e2e envelope — PLAN.md section 7: "Server
+/// validates only shape (base64-decodable, nonce/kid length limits, overall
+/// payload size cap) and treats the ciphertext as an opaque blob". Never
+/// decodes or otherwise inspects `message`/`title`'s ciphertext content.
+///
+/// A complete no-op (returns `Ok(())` immediately) unless `encoding` is
+/// (case-insensitively) `"e2e"` — this is opt-in per-message, not a
+/// server-wide mode, so plain-text publishes are never affected.
+///
+/// Shared by both the HTTP publish path (`http::publish`) and the bus
+/// extension's client message-frame path (`http::bus`), per PLAN.md's
+/// implication that e2e isn't HTTP-only.
+pub fn validate_e2e(encoding: Option<&str>, enc: Option<&Enc>, message: Option<&str>, title: Option<&str>) -> Result<(), AppError> {
+    let is_e2e = encoding.map(|e| e.eq_ignore_ascii_case("e2e")).unwrap_or(false);
+    if !is_e2e {
+        return Ok(());
+    }
+
+    let enc = enc.ok_or_else(|| {
+        AppError::BadRequest("encoding=e2e requires an 'enc' object with non-empty alg/kid/nonce".to_string())
+    })?;
+    if enc.alg.is_empty() || enc.kid.is_empty() || enc.nonce.is_empty() {
+        return Err(AppError::BadRequest(
+            "encoding=e2e requires enc.alg, enc.kid, and enc.nonce to all be non-empty".to_string(),
+        ));
+    }
+    if enc.alg.len() > E2E_ALG_MAX_LEN {
+        return Err(AppError::BadRequest(format!("enc.alg exceeds {E2E_ALG_MAX_LEN} bytes")));
+    }
+    if enc.kid.len() > E2E_KID_MAX_LEN {
+        return Err(AppError::BadRequest(format!("enc.kid exceeds {E2E_KID_MAX_LEN} bytes")));
+    }
+
+    // Only shape-checked: must decode as *some* common base64 variant
+    // (standard or URL-safe, padded or not — the client's choice, PLAN.md
+    // doesn't mandate one), and the decoded byte length must be sane. The
+    // decoded bytes themselves are discarded immediately; the server never
+    // uses the nonce for anything.
+    let decoded_len = STANDARD
+        .decode(enc.nonce.as_bytes())
+        .or_else(|_| URL_SAFE.decode(enc.nonce.as_bytes()))
+        .or_else(|_| STANDARD_NO_PAD.decode(enc.nonce.as_bytes()))
+        .or_else(|_| URL_SAFE_NO_PAD.decode(enc.nonce.as_bytes()))
+        .map_err(|_| AppError::BadRequest("enc.nonce is not valid base64".to_string()))?
+        .len();
+    if decoded_len > E2E_NONCE_MAX_DECODED_LEN {
+        return Err(AppError::BadRequest(format!(
+            "enc.nonce decodes to more than {E2E_NONCE_MAX_DECODED_LEN} bytes"
+        )));
+    }
+
+    // Overall payload size cap only — content is never decoded/validated
+    // (PLAN.md 7: "treats the ciphertext as an opaque blob").
+    if let Some(msg) = message {
+        if msg.len() > E2E_PAYLOAD_MAX_LEN {
+            return Err(AppError::BadRequest(format!("e2e message exceeds {E2E_PAYLOAD_MAX_LEN} bytes")));
+        }
+    }
+    if let Some(t) = title {
+        if t.len() > E2E_PAYLOAD_MAX_LEN {
+            return Err(AppError::BadRequest(format!("e2e title exceeds {E2E_PAYLOAD_MAX_LEN} bytes")));
+        }
+    }
+
+    Ok(())
 }

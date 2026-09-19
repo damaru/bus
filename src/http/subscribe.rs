@@ -91,6 +91,13 @@ fn collect_backlog(topics: &[Arc<Topic>], since: &SinceMarker) -> Vec<Envelope> 
 /// mode just the filtered backlog (then ends); otherwise `open`, backlog,
 /// then live fanout interleaved with periodic `keepalive`s until the
 /// consumer drops the stream.
+///
+/// Every `filters.pass(&env)` call below applies the `id=`/`message=`/
+/// `title=`/`priority=`/`tags=` content filters uniformly to every
+/// message, e2e-encoded or not — see [`QueryFilter`]'s doc comment
+/// (`http::params`) for why `message=`/`title=` simply don't match
+/// e2e-encoded ciphertext (PLAN.md section 7), and why that's expected
+/// rather than a bug to special-case here.
 fn envelope_stream(
     topics: Vec<Arc<Topic>>,
     poll: bool,

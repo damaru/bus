@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::model::{generate_message_id, now_unix, Control, ControlType, Envelope, SinceMarker};
+use crate::model::{generate_message_id, now_unix, Control, ControlType, Enc, Envelope, SinceMarker};
 use crate::store::cache::Cache;
 
 /// Identifies a single subscriber's fanout channel within a [`Topic`].
@@ -360,7 +360,10 @@ impl Topic {
     /// participant record itself (defense-in-depth: the `/bus` handler
     /// should already have checked this before calling, but a session
     /// that was write-capable at connect time and got revoked mid-session
-    /// would still be caught here).
+    /// would still be caught here). Accepts `encoding`/`enc` (M5): PLAN.md
+    /// doesn't restrict e2e to HTTP-only publish, and shape validation is
+    /// the caller's job (`http::params::validate_e2e`, same function used
+    /// by the HTTP publish path) so it isn't duplicated here.
     #[allow(clippy::too_many_arguments)]
     pub fn bus_publish_message(
         &self,
@@ -370,6 +373,8 @@ impl Topic {
         priority: Option<u8>,
         tags: Vec<String>,
         click: Option<String>,
+        encoding: Option<String>,
+        enc: Option<Enc>,
     ) -> Result<Envelope> {
         let sender_label = {
             let participants = self.participants.lock().unwrap();
@@ -381,7 +386,20 @@ impl Topic {
         };
         let topic_name = self.name.clone();
         self.publish(move |seq, id, time| {
-            Envelope::new_bus_message(topic_name, seq, id, time, sender_label, title, message, priority, tags, click)
+            Envelope::new_bus_message(
+                topic_name,
+                seq,
+                id,
+                time,
+                sender_label,
+                title,
+                message,
+                priority,
+                tags,
+                click,
+                encoding,
+                enc,
+            )
         })
     }
 

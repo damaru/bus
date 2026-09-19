@@ -1,9 +1,12 @@
-//! Message model: `Envelope`, `Event`, `Control`, `SinceMarker` — ports
-//! `model/model.go` plus the bus/e2e wire-format extensions from PLAN.md
-//! section 4.1/4.2.
+//! Message model: `Envelope`, `Event`, `Control`, `Enc`, `SinceMarker` —
+//! ports `model/model.go` plus the bus/e2e wire-format extensions from
+//! PLAN.md section 4.1/4.2/7.
 //!
-//! `enc` is always `None` until M5 (e2e envelope); `control`/`Event::Control`
-//! are fully wired up as of M4 (bus extension).
+//! `control`/`Event::Control` are fully wired up as of M4 (bus extension);
+//! `enc`/`encoding` are fully wired up as of M5 (e2e envelope) — the server
+//! only ever validates their *shape* (see `http::params::validate_e2e`),
+//! never their content: `message`/`title` ciphertext is stored, replayed,
+//! and fanned out as an opaque `String`, byte-for-byte.
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -106,6 +109,20 @@ impl Control {
     }
 }
 
+/// E2E envelope metadata (PLAN.md section 4.1/7), present on an [`Envelope`]
+/// only when `encoding == "e2e"`. Every field is an opaque string from the
+/// server's point of view: `alg`/`kid` are free-form client-defined
+/// identifiers (never interpreted), and `nonce` is base64 text that the
+/// server only shape-checks (decodability + length cap via
+/// `http::params::validate_e2e`) — it never attempts to use the nonce for
+/// anything, and never touches `message`'s ciphertext content at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Enc {
+    pub alg: String,
+    pub kid: String,
+    pub nonce: String,
+}
+
 /// The message envelope: superset of ntfy's `model.Message`. See PLAN.md
 /// section 4.1 for the wire format this mirrors field-for-field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,14 +152,14 @@ pub struct Envelope {
     pub click: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// "base64" for encoded bytes, "e2e" for opaque ciphertext (M5). Empty
-    /// (`None`) means raw UTF-8.
+    /// "base64" for encoded bytes, "e2e" for opaque ciphertext (M5, see
+    /// [`Enc`]). Empty (`None`) means raw UTF-8.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<String>,
-    /// NEW: e2e envelope metadata (`alg`/`kid`/`nonce`), only present when
-    /// `encoding == "e2e"`. Always `None` until M5.
+    /// E2E envelope metadata (`alg`/`kid`/`nonce`), only present when
+    /// `encoding == "e2e"` (M5). See [`Enc`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub enc: Option<serde_json::Value>,
+    pub enc: Option<Enc>,
     /// Bus control payload, present only when `event == Event::Control`
     /// (M4). `None`/omitted for every other event, preserving the M1-era
     /// JSON shape for plain ntfy-compatible clients.
@@ -166,6 +183,7 @@ impl Envelope {
         click: Option<String>,
         content_type: Option<String>,
         encoding: Option<String>,
+        enc: Option<Enc>,
         expires: Option<i64>,
     ) -> Self {
         Self {
@@ -183,13 +201,16 @@ impl Envelope {
             click,
             content_type,
             encoding,
-            enc: None,
+            enc,
             control: None,
         }
     }
 
     /// Builds a `message` event envelope tagged with a bus participant's
     /// `sender` label (PLAN.md 4.1). Used by `Topic::bus_publish_message`.
+    /// Accepts `encoding`/`enc` too (M5): PLAN.md doesn't restrict e2e to
+    /// HTTP-only publish, so bus participants can send encrypted messages
+    /// the same way.
     #[allow(clippy::too_many_arguments)]
     pub fn new_bus_message(
         topic: impl Into<String>,
@@ -202,8 +223,10 @@ impl Envelope {
         priority: Option<u8>,
         tags: Vec<String>,
         click: Option<String>,
+        encoding: Option<String>,
+        enc: Option<Enc>,
     ) -> Self {
-        let mut env = Self::new_message(topic, seq, id, time, title, message, priority, tags, click, None, None, None);
+        let mut env = Self::new_message(topic, seq, id, time, title, message, priority, tags, click, None, encoding, enc, None);
         env.sender = Some(sender);
         env
     }

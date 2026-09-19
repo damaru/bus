@@ -7,10 +7,15 @@
 //! pin this down)
 //!
 //! Incoming WS **text** frames are parsed as one JSON object:
-//! - `{"event": "message", "title"?, "message", "priority"?, "tags"?, "click"?}`
+//! - `{"event": "message", "title"?, "message", "priority"?, "tags"?, "click"?, "encoding"?, "enc"?}`
 //!   — a full envelope-shaped publish. `id`/`seq`/`time`/`topic`/`sender`
-//!   are always server-assigned and ignored if sent.
-//! - `{"title"?, "message", "priority"?, "tags"?, "click"?}` with **no**
+//!   are always server-assigned and ignored if sent. `encoding`/`enc` (M5)
+//!   work exactly like the HTTP publish path: set `encoding: "e2e"` and
+//!   `enc: {alg, kid, nonce}` to publish an opaque e2e-encrypted message
+//!   over the bus — same shape validation (`params::validate_e2e`), same
+//!   opaque byte-for-byte passthrough. Omitted (the common case) means a
+//!   plain-text message.
+//! - `{"title"?, "message", "priority"?, "tags"?, "click"?, "encoding"?, "enc"?}` with **no**
 //!   `"event"` key at all — the same shape, treated as an implicit
 //!   `message` event. This is the minimal/simple form for clients that
 //!   don't want to think about the envelope wrapper.
@@ -39,7 +44,7 @@ use crate::auth::Visitor;
 use crate::error::AppError;
 use crate::http::params;
 use crate::http::AppState;
-use crate::model::{Control, ControlType, Envelope, SinceMarker};
+use crate::model::{Control, ControlType, Enc, Envelope, SinceMarker};
 use crate::store::acl::Permission;
 use crate::topic::Topic;
 
@@ -98,6 +103,10 @@ struct IncomingFrame {
     priority: Option<serde_json::Value>,
     tags: Option<Vec<String>>,
     click: Option<String>,
+    /// M5: same `Envelope` fields as the HTTP publish path, round-tripped
+    /// for free since `Enc` already derives `Deserialize`.
+    encoding: Option<String>,
+    enc: Option<Enc>,
     control: Option<RawControlFrame>,
 }
 
@@ -124,6 +133,11 @@ async fn run_bus(
         return;
     }
 
+    // Note: `/bus` doesn't support `http::params::QueryFilter` content
+    // filters at all (no `message=`/`title=` etc query params here) — only
+    // `since=`. So the "filters don't meaningfully match e2e ciphertext"
+    // caveat documented on `QueryFilter` (PLAN.md section 7) doesn't even
+    // arise on this path; every backlog entry is replayed as-is.
     for env in topic.replay_since(&since) {
         if send_envelope(&mut socket, &env).await.is_err() {
             return;
@@ -232,7 +246,27 @@ async fn handle_incoming_text(
                 None => None,
             };
             let tags = frame.tags.unwrap_or_default();
-            let result = topic.bus_publish_message(session_id, frame.title, frame.message, priority, tags, frame.click);
+            // Opt-in e2e shape validation (M5), same rules/limits as the
+            // HTTP publish path — reused, not duplicated.
+            if let Err(e) = params::validate_e2e(
+                frame.encoding.as_deref(),
+                frame.enc.as_ref(),
+                frame.message.as_deref(),
+                frame.title.as_deref(),
+            ) {
+                send_error(socket, topic_name, &e.to_string()).await;
+                return;
+            }
+            let result = topic.bus_publish_message(
+                session_id,
+                frame.title,
+                frame.message,
+                priority,
+                tags,
+                frame.click,
+                frame.encoding,
+                frame.enc,
+            );
             if let Err(e) = result {
                 send_error(socket, topic_name, &e.to_string()).await;
             }
