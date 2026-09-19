@@ -19,3 +19,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "limit"] }
 anyhow = "1"
+futures = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+bytes = "1"
+form_urlencoded = "1"

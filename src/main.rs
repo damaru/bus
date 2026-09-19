@@ -57,7 +57,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(bind = %config.bind, data_dir = ?config.data_dir, "starting bus server");
 
     let store = Arc::new(Store::open(&config.data_dir)?);
-    let state = http::AppState { store };
+    let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize));
+    let state = http::AppState { store, topics };
     let app = http::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
