@@ -375,3 +375,102 @@ async fn send_envelope(socket: &mut WebSocket, envelope: &Envelope) -> Result<()
     let text = serde_json::to_string(envelope).unwrap_or_default();
     socket.send(Message::Text(text)).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incoming_frame_minimal_message_shape_with_no_event_key() {
+        let frame: IncomingFrame = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
+        assert_eq!(frame.event, None);
+        assert_eq!(frame.message.as_deref(), Some("hi"));
+        assert!(frame.control.is_none());
+    }
+
+    #[test]
+    fn incoming_frame_full_envelope_message_shape() {
+        let frame: IncomingFrame = serde_json::from_str(
+            r#"{"event":"message","title":"t","message":"hi","priority":5,"tags":["a","b"],"click":"http://x"}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.event.as_deref(), Some("message"));
+        assert_eq!(frame.title.as_deref(), Some("t"));
+        assert_eq!(frame.message.as_deref(), Some("hi"));
+        assert_eq!(frame.priority, Some(serde_json::json!(5)));
+        assert_eq!(frame.tags, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(frame.click.as_deref(), Some("http://x"));
+    }
+
+    #[test]
+    fn incoming_frame_e2e_message_shape() {
+        let frame: IncomingFrame = serde_json::from_str(
+            r#"{"message":"ciphertext","encoding":"e2e","enc":{"alg":"a","kid":"k","nonce":"n"}}"#,
+        )
+        .unwrap();
+        assert_eq!(frame.encoding.as_deref(), Some("e2e"));
+        let enc = frame.enc.expect("expected enc object");
+        assert_eq!(enc.alg, "a");
+        assert_eq!(enc.kid, "k");
+        assert_eq!(enc.nonce, "n");
+    }
+
+    #[test]
+    fn incoming_frame_control_shape_typing_ack_ping() {
+        for ty in ["typing", "ack", "ping"] {
+            let json = format!(r#"{{"event":"control","control":{{"type":"{ty}"}}}}"#);
+            let frame: IncomingFrame = serde_json::from_str(&json).unwrap();
+            assert_eq!(frame.event.as_deref(), Some("control"));
+            let control = frame.control.expect("expected a control object");
+            assert!(matches!(control.r#type, ControlType::Typing | ControlType::Ack | ControlType::Ping));
+        }
+    }
+
+    #[test]
+    fn incoming_frame_control_with_data_payload() {
+        let frame: IncomingFrame =
+            serde_json::from_str(r#"{"event":"control","control":{"type":"ack","data":{"id":"abc123"}}}"#).unwrap();
+        let control = frame.control.unwrap();
+        assert_eq!(control.r#type, ControlType::Ack);
+        assert_eq!(control.data, Some(serde_json::json!({"id": "abc123"})));
+    }
+
+    #[test]
+    fn incoming_frame_rejects_server_only_control_types_at_the_type_level_ok_but_dispatch_rejects_them() {
+        // The type itself deserializes fine (ControlType covers all 9
+        // variants) -- rejection of server-only types (join/leave/
+        // presence/pong/error/close) happens in `handle_incoming_text`'s
+        // dispatch logic, not at parse time. This test documents that
+        // split: parsing is permissive, dispatch is where validation lives.
+        let frame: IncomingFrame =
+            serde_json::from_str(r#"{"event":"control","control":{"type":"pong"}}"#).unwrap();
+        let control = frame.control.unwrap();
+        assert_eq!(control.r#type, ControlType::Pong);
+        assert!(
+            !matches!(control.r#type, ControlType::Typing | ControlType::Ack | ControlType::Ping),
+            "pong must not be in the client-allowed set that handle_incoming_text checks"
+        );
+    }
+
+    #[test]
+    fn incoming_frame_malformed_json_fails_to_parse() {
+        let result: Result<IncomingFrame, _> = serde_json::from_str("{not valid json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn incoming_frame_unknown_control_type_string_fails_to_parse() {
+        let result: Result<IncomingFrame, _> =
+            serde_json::from_str(r#"{"event":"control","control":{"type":"not-a-real-type"}}"#);
+        assert!(result.is_err(), "an unrecognized control type string should fail deserialization");
+    }
+
+    #[test]
+    fn parse_priority_value_accepts_numbers_and_aliases_rejects_out_of_range() {
+        assert_eq!(parse_priority_value(&serde_json::json!(5)), Ok(5));
+        assert_eq!(parse_priority_value(&serde_json::json!("high")), Ok(4));
+        assert!(parse_priority_value(&serde_json::json!(0)).is_err());
+        assert!(parse_priority_value(&serde_json::json!(6)).is_err());
+        assert!(parse_priority_value(&serde_json::json!("not-a-priority")).is_err());
+    }
+}

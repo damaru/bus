@@ -349,3 +349,77 @@ pub fn validate_e2e(encoding: Option<&str>, enc: Option<&Enc>, message: Option<&
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn since_absent_defaults_to_none_for_live_and_all_for_poll() {
+        let headers = empty_headers();
+        let q = query(&[]);
+        assert_eq!(parse_since(&headers, &q, false).unwrap(), SinceMarker::None);
+        assert_eq!(parse_since(&headers, &q, true).unwrap(), SinceMarker::All);
+    }
+
+    #[test]
+    fn since_all_none_latest_keywords() {
+        let headers = empty_headers();
+        assert_eq!(parse_since(&headers, &query(&[("since", "all")]), false).unwrap(), SinceMarker::All);
+        assert_eq!(parse_since(&headers, &query(&[("since", "none")]), true).unwrap(), SinceMarker::None);
+        assert_eq!(parse_since(&headers, &query(&[("since", "latest")]), false).unwrap(), SinceMarker::Latest);
+    }
+
+    #[test]
+    fn since_unix_timestamp() {
+        let headers = empty_headers();
+        let result = parse_since(&headers, &query(&[("since", "1700000000")]), false).unwrap();
+        assert_eq!(result, SinceMarker::Time(1700000000));
+    }
+
+    #[test]
+    fn since_message_id() {
+        let headers = empty_headers();
+        let id = model::generate_message_id();
+        let result = parse_since(&headers, &query(&[("since", &id)]), false).unwrap();
+        assert_eq!(result, SinceMarker::Id(id));
+    }
+
+    #[test]
+    fn since_duration_shorthand_resolves_relative_to_now() {
+        let headers = empty_headers();
+        let before = model::now_unix();
+        let result = parse_since(&headers, &query(&[("since", "1h")]), false).unwrap();
+        match result {
+            SinceMarker::Time(t) => {
+                // Small slack for the wall-clock tick between capturing
+                // `before` and `parse_since`'s internal `now_unix()` call.
+                assert!((t - (before - 3600)).abs() <= 2, "expected ~1h ago, got {t} (before={before})");
+            }
+            other => panic!("expected SinceMarker::Time(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn since_invalid_value_is_bad_request() {
+        let headers = empty_headers();
+        let err = parse_since(&headers, &query(&[("since", "not-a-valid-since-value!!!")]), false).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn since_reads_x_since_header_alias() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-since", "all".parse().unwrap());
+        let result = parse_since(&headers, &query(&[]), false).unwrap();
+        assert_eq!(result, SinceMarker::All);
+    }
+}

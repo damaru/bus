@@ -213,3 +213,89 @@ fn topic_matches(pattern: &str, topic: &str) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> sled::Db {
+        sled::Config::new().temporary(true).open().expect("failed to open temporary sled db")
+    }
+
+    #[test]
+    fn topic_pattern_matching_exact_and_wildcards() {
+        assert!(topic_matches("mytopic", "mytopic"));
+        assert!(!topic_matches("mytopic", "othertopic"));
+        assert!(topic_matches("*", "anything"));
+        assert!(topic_matches("myapp-*", "myapp-prod"));
+        assert!(!topic_matches("myapp-*", "otherapp-prod"));
+        assert!(topic_matches("*-prod", "myapp-prod"));
+        assert!(!topic_matches("*-prod", "myapp-staging"));
+        assert!(topic_matches("a*c", "abc"));
+        assert!(topic_matches("a*c", "ac"));
+        assert!(!topic_matches("a*c", "ab"));
+    }
+
+    #[test]
+    fn default_access_fallback_when_no_grants_exist() {
+        let acl = Acl::new(temp_db());
+        assert_eq!(acl.resolve(None, "anytopic", DefaultAccess::ReadWrite).unwrap(), Permission::ReadWrite);
+        assert_eq!(acl.resolve(Some("alice"), "anytopic", DefaultAccess::ReadOnly).unwrap(), Permission::Read);
+        assert_eq!(acl.resolve(None, "anytopic", DefaultAccess::DenyAll).unwrap(), Permission::DenyAll);
+    }
+
+    #[test]
+    fn explicit_grant_overrides_default_access() {
+        let acl = Acl::new(temp_db());
+        acl.grant(EVERYONE, "restricted", Permission::DenyAll).unwrap();
+        // default_access says read-write, but the explicit '*' deny wins.
+        assert_eq!(acl.resolve(None, "restricted", DefaultAccess::ReadWrite).unwrap(), Permission::DenyAll);
+        // a topic with no matching grant still falls back to default_access.
+        assert_eq!(acl.resolve(None, "untouched", DefaultAccess::ReadWrite).unwrap(), Permission::ReadWrite);
+    }
+
+    #[test]
+    fn user_specific_grant_outranks_everyone_regardless_of_pattern_length() {
+        let acl = Acl::new(temp_db());
+        // '*' has a longer/more-specific-looking pattern than the user
+        // grant, but user-specificity must still win outright (rule 1
+        // before rule 2).
+        acl.grant(EVERYONE, "topic-with-a-long-pattern-match", Permission::ReadWrite).unwrap();
+        acl.grant("alice", "*", Permission::DenyAll).unwrap();
+        assert_eq!(
+            acl.resolve(Some("alice"), "topic-with-a-long-pattern-match", DefaultAccess::ReadWrite).unwrap(),
+            Permission::DenyAll,
+            "a user-specific grant must outrank '*' even with a shorter pattern"
+        );
+    }
+
+    #[test]
+    fn longer_pattern_wins_among_same_principal() {
+        let acl = Acl::new(temp_db());
+        acl.grant(EVERYONE, "*", Permission::DenyAll).unwrap();
+        acl.grant(EVERYONE, "myapp-*", Permission::ReadWrite).unwrap();
+        assert_eq!(acl.resolve(None, "myapp-prod", DefaultAccess::DenyAll).unwrap(), Permission::ReadWrite);
+        assert_eq!(acl.resolve(None, "otherapp-prod", DefaultAccess::DenyAll).unwrap(), Permission::DenyAll);
+    }
+
+    #[test]
+    fn revoke_removes_a_grant() {
+        let acl = Acl::new(temp_db());
+        acl.grant(EVERYONE, "topic", Permission::ReadWrite).unwrap();
+        assert_eq!(acl.resolve(None, "topic", DefaultAccess::DenyAll).unwrap(), Permission::ReadWrite);
+        acl.revoke(EVERYONE, "topic").unwrap();
+        assert_eq!(acl.resolve(None, "topic", DefaultAccess::DenyAll).unwrap(), Permission::DenyAll);
+    }
+
+    #[test]
+    fn permission_bit_tests() {
+        assert!(!Permission::DenyAll.is_read());
+        assert!(!Permission::DenyAll.is_write());
+        assert!(Permission::Read.is_read());
+        assert!(!Permission::Read.is_write());
+        assert!(!Permission::Write.is_read());
+        assert!(Permission::Write.is_write());
+        assert!(Permission::ReadWrite.is_read());
+        assert!(Permission::ReadWrite.is_write());
+    }
+}

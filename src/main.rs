@@ -1,22 +1,13 @@
 //! CLI entry point: `bus serve`, `bus admin ...`.
 
-mod admin;
-mod auth;
-mod config;
-mod error;
-mod http;
-mod model;
-mod store;
-mod topic;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
-use config::Config;
-use store::Store;
+use bus::admin;
+use bus::config::Config;
 
 #[derive(Debug, Parser)]
 #[command(name = "bus", about = "Minimal ntfy-compatible pub/sub server with a bidirectional bus extension")]
@@ -63,33 +54,19 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     tracing::info!(bind = %config.bind, data_dir = ?config.data_dir, "starting bus server");
 
-    let store = Arc::new(Store::open(&config.data_dir)?);
+    // Single source of truth for wiring store/topics/auth/etc together —
+    // shared with the integration test suite via `bus::build_state`.
+    let state = bus::build_state(&config)?;
+    let store = state.store.clone();
+    let topics = state.topics.clone();
+    // Cache is cheap to re-derive from the store (just clones the sled::Db
+    // handle) — used here only by the retention sweep, which isn't part of
+    // `AppState` itself.
     let cache = Arc::new(store.cache());
-    let topic_limits = topic::TopicLimits {
-        max_topics: config.max_topics,
-        max_subscribers_per_topic: config.max_subscribers_per_topic,
-        max_subscribers_total: config.max_subscribers_total,
-        max_bus_participants_per_topic: config.max_bus_participants_per_topic,
-    };
-    let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache.clone(), topic_limits));
-    let users = Arc::new(store.users());
-    let acl = Arc::new(store.acl());
-    let auth_limiter = Arc::new(auth::AuthLimiter::new());
-    let publish_limiter = Arc::new(auth::PublishLimiter::new(config.publish_rate_limit));
 
-    spawn_retention_sweep(cache.clone(), config.cache_duration, config.cache_count, config.cache_size);
+    spawn_retention_sweep(cache, config.cache_duration, config.cache_count, config.cache_size);
 
-    let state = http::AppState {
-        store: store.clone(),
-        topics: topics.clone(),
-        users,
-        acl,
-        auth_limiter,
-        publish_limiter,
-        default_access: config.default_access,
-        max_message_bytes: config.max_message_bytes,
-    };
-    let app = http::router(state);
+    let app = bus::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
@@ -188,7 +165,7 @@ async fn wait_for_shutdown_signal() {
 /// the configured `cache-duration`/`cache-count`/`cache-size` limits (best-
 /// effort for size; see `store::cache::Cache::prune`). Runs on a dedicated
 /// blocking task since a full retention pass scans whole topic trees.
-fn spawn_retention_sweep(cache: Arc<store::cache::Cache>, max_age: std::time::Duration, max_count: u64, max_size_bytes: u64) {
+fn spawn_retention_sweep(cache: Arc<bus::store::cache::Cache>, max_age: std::time::Duration, max_count: u64, max_size_bytes: u64) {
     const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);

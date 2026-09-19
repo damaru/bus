@@ -226,3 +226,115 @@ impl Cache {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::generate_message_id;
+
+    fn temp_cache() -> Cache {
+        let db = sled::Config::new().temporary(true).open().expect("failed to open temporary sled db");
+        Cache::new(db)
+    }
+
+    fn envelope_at(topic: &str, seq: u64, time: i64) -> Envelope {
+        Envelope::new_message(
+            topic.to_string(),
+            seq,
+            generate_message_id(),
+            time,
+            None,
+            Some(format!("message {seq}")),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn next_seq_is_monotonic_and_persists_across_cache_instances() {
+        let db = sled::Config::new().temporary(true).open().unwrap();
+        let cache1 = Cache::new(db.clone());
+        assert_eq!(cache1.next_seq("t").unwrap(), 1);
+        assert_eq!(cache1.next_seq("t").unwrap(), 2);
+
+        // Simulate a restart: a fresh `Cache` wrapping the same underlying
+        // `sled::Db` handle must continue from the persisted counter.
+        let cache2 = Cache::new(db);
+        assert_eq!(cache2.last_seq("t").unwrap(), 2);
+        assert_eq!(cache2.next_seq("t").unwrap(), 3);
+    }
+
+    #[test]
+    fn prune_removes_only_entries_older_than_max_age() {
+        let cache = temp_cache();
+        let now = model::now_unix();
+        let old = envelope_at("agetopic", 1, now - 7200); // 2h old
+        let recent = envelope_at("agetopic", 2, now - 1800); // 30m old
+        let fresh = envelope_at("agetopic", 3, now);
+        cache.store_message("agetopic", &old).unwrap();
+        cache.store_message("agetopic", &recent).unwrap();
+        cache.store_message("agetopic", &fresh).unwrap();
+
+        let removed = cache
+            .prune("agetopic", Duration::from_secs(3600), u64::MAX, u64::MAX)
+            .unwrap();
+        assert_eq!(removed, 1, "only the 2h-old message should be pruned by a 1h max_age");
+
+        let remaining = cache.messages_since("agetopic", &SinceMarker::All).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].seq, 2);
+        assert_eq!(remaining[1].seq, 3);
+    }
+
+    #[test]
+    fn prune_keeps_only_the_newest_max_count_entries() {
+        let cache = temp_cache();
+        let now = model::now_unix();
+        for seq in 1..=5u64 {
+            cache.store_message("counttopic", &envelope_at("counttopic", seq, now)).unwrap();
+        }
+
+        let removed = cache.prune("counttopic", Duration::from_secs(86_400), 3, u64::MAX).unwrap();
+        assert_eq!(removed, 2, "5 entries capped to max_count=3 should remove the oldest 2");
+
+        let remaining = cache.messages_since("counttopic", &SinceMarker::All).unwrap();
+        let seqs: Vec<u64> = remaining.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 4, 5], "the 3 newest entries (highest seq) must survive");
+    }
+
+    #[test]
+    fn prune_trims_oldest_first_once_over_the_size_cap() {
+        let cache = temp_cache();
+        let now = model::now_unix();
+        let mut entry_size = 0usize;
+        for seq in 1..=5u64 {
+            let env = envelope_at("sizetopic", seq, now);
+            entry_size = serde_json::to_vec(&env).unwrap().len();
+            cache.store_message("sizetopic", &env).unwrap();
+        }
+
+        // Cap sized for roughly 2 entries -- age/count limits left wide
+        // open so only the size cap is exercised.
+        let cap = (entry_size * 2 + entry_size / 2) as u64;
+        let removed = cache.prune("sizetopic", Duration::from_secs(86_400), u64::MAX, cap).unwrap();
+        assert_eq!(removed, 3, "should trim oldest-first until under the size cap");
+
+        let remaining = cache.messages_since("sizetopic", &SinceMarker::All).unwrap();
+        let seqs: Vec<u64> = remaining.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![4, 5], "the newest entries must survive size-based trimming");
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_nothing_exceeds_any_limit() {
+        let cache = temp_cache();
+        let now = model::now_unix();
+        cache.store_message("quiettopic", &envelope_at("quiettopic", 1, now)).unwrap();
+        let removed = cache.prune("quiettopic", Duration::from_secs(86_400), 100, u64::MAX).unwrap();
+        assert_eq!(removed, 0);
+    }
+}
