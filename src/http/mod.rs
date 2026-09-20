@@ -1,10 +1,14 @@
-//! Axum `Router` assembly: routes, tracing middleware, body size limits.
+//! Axum `Router` assembly: routes, tracing middleware, body size limits,
+//! and a permissive CORS layer (any origin/method/header) so the ntfy web
+//! app — typically served from a different origin than the API — can call
+//! this server directly from the browser.
 
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::get;
 use axum::Router;
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{AuthLimiter, PublishLimiter};
@@ -81,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/:topic/bus", get(bus::bus_ws))
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
