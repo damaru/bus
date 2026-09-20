@@ -39,6 +39,98 @@ struct JsonPublishBody {
     enc: Option<Enc>,
 }
 
+/// Subset of ntfy's `publishMessage` JSON shape, accepted when publishing
+/// to the server root (`PUT`/`POST /`) instead of `/{topic}` — ntfy's
+/// "publish as JSON" API, used by the ntfy web app itself (`Api.js`
+/// `publish()`), which always PUTs to the base URL with `topic` embedded
+/// in the body rather than the path. Mirrors upstream ntfy's
+/// `transformBodyJSON` (server.go): the JSON `message` field becomes the
+/// downstream request body (mattering only for the local-attachment-upload
+/// branch, where that text doubles as file content), and everything else
+/// is resolved directly from the parsed fields rather than round-tripped
+/// through synthetic headers.
+#[derive(Debug, Default, Deserialize)]
+struct RootPublishBody {
+    topic: Option<String>,
+    title: Option<String>,
+    message: Option<String>,
+    priority: Option<serde_json::Value>,
+    tags: Option<Vec<String>>,
+    click: Option<String>,
+    attach: Option<String>,
+    filename: Option<String>,
+    markdown: Option<bool>,
+    encoding: Option<String>,
+    enc: Option<Enc>,
+}
+
+/// Handles `PUT`/`POST /`: ntfy's "publish as JSON" endpoint. Reads
+/// `topic` (required) and the rest of `RootPublishBody` from the JSON
+/// body, then funnels into the same [`finish_publish`] tail as the
+/// `/{topic}` handler below. See [`RootPublishBody`] for why this is a
+/// separate entry point rather than a `Path`-less variant of [`publish`].
+pub async fn publish_root(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let parsed: RootPublishBody =
+        serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("invalid JSON body: {e}")))?;
+    let topic = parsed
+        .topic
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| AppError::BadRequest("topic missing from JSON body".to_string()))?;
+    params::validate_topic_name(&topic)?;
+    let query = params::parse_query(&uri);
+
+    let visitor = crate::auth::authenticate(&headers, &query, addr.ip(), &state.users, &state.auth_limiter)?;
+    crate::http::require_permission(&state, &visitor, &topic, Permission::Write)?;
+
+    let rate_key = crate::auth::RateKey::for_visitor(&visitor, addr.ip());
+    if !state.publish_limiter.check(rate_key) {
+        return Err(AppError::TooManyRequests(
+            "publish rate limit exceeded, slow down".to_string(),
+        ));
+    }
+
+    let mut priority: Option<u8> = None;
+    if let Some(v) = parsed.priority {
+        priority = Some(parse_priority_value(&v)?);
+    }
+    let filename = parsed.filename.filter(|s| !s.is_empty());
+    let attach_url = parsed.attach.filter(|s| !s.is_empty());
+    let content_type = if parsed.markdown.unwrap_or(false) {
+        Some("text/markdown".to_string())
+    } else {
+        None
+    };
+    // ntfy transforms the JSON body into a plain-text request body equal
+    // to `message` before delegating to the shared publish path — this
+    // matters only for the local-upload branch, where that text doubles
+    // as the uploaded file's content.
+    let message_text = parsed.message.filter(|s| !s.is_empty());
+    let body_for_attachment = Bytes::from(message_text.clone().unwrap_or_default());
+
+    finish_publish(
+        state,
+        topic,
+        parsed.title,
+        parsed.click,
+        parsed.tags.unwrap_or_default(),
+        priority,
+        parsed.encoding,
+        parsed.enc,
+        filename,
+        attach_url,
+        content_type,
+        message_text,
+        body_for_attachment,
+    )
+    .await
+}
+
 /// Handles `PUT`/`POST /{topic}`: publishes a message and returns the
 /// stored envelope as JSON (ntfy-style publish ack).
 pub async fn publish(
@@ -153,6 +245,47 @@ pub async fn publish(
 
     let message_text = message_text.filter(|s| !s.is_empty());
 
+    finish_publish(
+        state,
+        topic,
+        title,
+        click,
+        tags,
+        priority,
+        encoding,
+        enc,
+        filename,
+        attach_url,
+        content_type,
+        message_text,
+        body,
+    )
+    .await
+}
+
+/// Shared tail of both publish entry points ([`publish`] and
+/// [`publish_root`]): e2e shape validation, attachment resolution
+/// (remote-URL vs local-upload vs none), envelope construction, and
+/// persistence. `body` is the raw bytes used as attachment content when
+/// `filename` is set (the real HTTP request body for [`publish`]; the
+/// JSON `message` field re-encoded as bytes for [`publish_root`], per
+/// ntfy's own `transformBodyJSON` semantics).
+#[allow(clippy::too_many_arguments)]
+async fn finish_publish(
+    state: AppState,
+    topic: String,
+    title: Option<String>,
+    click: Option<String>,
+    tags: Vec<String>,
+    priority: Option<u8>,
+    encoding: Option<String>,
+    enc: Option<Enc>,
+    filename: Option<String>,
+    attach_url: Option<String>,
+    content_type: Option<String>,
+    message_text: Option<String>,
+    body: Bytes,
+) -> Result<Json<Envelope>, AppError> {
     // Opt-in shape validation, only when encoding == "e2e" (PLAN.md 7).
     // Never decodes/inspects message/title content beyond a size cap.
     params::validate_e2e(encoding.as_deref(), enc.as_ref(), message_text.as_deref(), title.as_deref())?;
@@ -181,6 +314,7 @@ pub async fn publish(
     let topic_ref = state.topics.get_or_create(&topic)?;
     let topic_name = topic.clone();
     let envelope = if let (Some(filename), None) = (&filename, &attachment) {
+
         // Local file upload: filename set, no attach_url (attach_url
         // takes precedence if somehow both are set — matches ntfy's
         // dispatch order in handlePublishBody).

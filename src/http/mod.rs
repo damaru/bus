@@ -70,6 +70,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route(
+            "/",
+            axum::routing::post(publish::publish_root).put(publish::publish_root),
+        )
+        .route(
             "/file/:id",
             axum::routing::get(attachment::download).head(attachment::download),
         )
