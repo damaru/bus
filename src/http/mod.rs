@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
             "/:topic",
             axum::routing::post(publish::publish).put(publish::publish),
         )
+        .route("/:topic/auth", get(subscribe::subscribe_auth))
         .route("/:topic/json", get(subscribe::subscribe_json))
         .route("/:topic/sse", get(subscribe::subscribe_sse))
         .route("/:topic/raw", get(subscribe::subscribe_raw))

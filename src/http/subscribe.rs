@@ -190,6 +190,36 @@ fn event_name(event: Event) -> &'static str {
     }
 }
 
+/// `GET /{topic}/auth` — ntfy-compatible auth-check endpoint. The ntfy web
+/// app (and Android/iOS clients) call this before subscribing to give the
+/// user an immediate, friendly "you don't have access" error instead of
+/// silently failing the subsequent `/json`/`/sse`/`/ws` request. Supports
+/// the same comma-separated multi-topic path as the other subscribe
+/// endpoints. Returns `200` with an empty JSON body if the visitor has
+/// **read** access to every named topic; otherwise the same `401`/`403`
+/// an actual subscribe attempt would return. Does not create the topic in
+/// the registry (unlike `prepare()`, used by the streaming endpoints) —
+/// this is a pure permission probe with no side effects.
+pub async fn subscribe_auth(
+    State(state): State<AppState>,
+    Path(topic_path): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Response, AppError> {
+    let names = params::split_topics(&topic_path)?;
+    let query = params::parse_query(&uri);
+    let visitor = crate::auth::authenticate(&headers, &query, addr.ip(), &state.users, &state.auth_limiter)?;
+    for name in &names {
+        crate::http::require_permission(&state, &visitor, name, Permission::Read)?;
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .expect("valid response"))
+}
+
 /// `GET /{topic}/json` — newline-delimited JSON stream.
 pub async fn subscribe_json(
     State(state): State<AppState>,
