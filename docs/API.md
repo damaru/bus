@@ -251,8 +251,10 @@ websocat "ws://localhost:8080/alerts/ws?poll=true&since=all"
 ## Attachments
 
 A published message can carry a **local file upload** or a **remote URL** as an
-attachment. This is disabled by default — both `--attachment-dir` and `--base-url` must be
-set on `bus serve` to enable it (setting only one is a startup error; see the
+attachment. This is **enabled by default** — `--attachment-dir` defaults to
+`~/.cache/bus/attachments` and `--base-url` defaults to a URL derived from `--bind`; either
+flag alone is enough to enable it (the other gets its own default filled in). Pass
+`--no-attachments` to disable the feature outright (see the
 [README's configuration table](../README.md#configuration)). If disabled, publishing with
 `filename=`/`attach=` returns `400`.
 
@@ -421,9 +423,9 @@ Topic patterns may contain `*` anywhere (`myapp-*`, `*-prod`, `a*c`, or bare `*`
 
 ## Admin CLI
 
-`bus admin <user|token|acl> ... [--data-dir <dir>]` (default `--data-dir ./data`, same as
-`bus serve`). Operates directly on the sled database — **stop `bus serve` first** if it's
-running against the same `--data-dir` (sled locks the directory to one process).
+`bus admin <user|token|acl> ... [--data-dir <dir>]` (default `--data-dir ~/.cache/bus/data`,
+same as `bus serve`). Operates directly on the sled database — **stop `bus serve` first** if
+it's running against the same `--data-dir` (sled locks the directory to one process).
 
 | Command | Arguments | Example |
 |---|---|---|

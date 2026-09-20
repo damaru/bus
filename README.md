@@ -83,7 +83,7 @@ All flags apply to `bus serve`. `bus admin ...` only takes `--data-dir` (see
 | Flag | Default | Description |
 |---|---|---|
 | `--bind` | `127.0.0.1:8080` | Address (and port) to bind the HTTP server to. |
-| `--data-dir` | `./data` | Directory for the sled embedded database. |
+| `--data-dir` | `~/.cache/bus/data` | Directory for the sled embedded database (`$XDG_CACHE_HOME/bus/data` if that's set). |
 | `--cache-duration` | `12h` | How long cached messages are retained before being pruned. |
 | `--cache-size` | `1073741824` (1 GiB) | Maximum total size (bytes) of the message cache (best-effort). |
 | `--cache-count` | `10000` | Maximum number of cached messages per topic. |
@@ -95,8 +95,9 @@ All flags apply to `bus serve`. `bus admin ...` only takes `--data-dir` (see
 | `--max-subscribers-total` | `10000` | Max concurrent subscriber connections across the whole server (a global soft cap on top of the per-topic cap). |
 | `--max-bus-participants-per-topic` | `200` | Max concurrent `/bus` participants on a single topic. |
 | `--shutdown-grace-secs` | `10` | Bounded grace period after SIGINT/SIGTERM before forcing remaining connections closed. |
-| `--attachment-dir` | unset (disabled) | Directory to store uploaded file attachments. Must be set together with `--base-url` (or both left unset) to enable/disable the feature — setting only one is a startup error. |
-| `--base-url` | unset (disabled) | Public base URL clients use to reach this server (e.g. `https://bus.example.com`), used to build attachment download URLs. Must be set together with `--attachment-dir`. |
+| `--attachment-dir` | `~/.cache/bus/attachments` | Directory to store uploaded file attachments. Enabled by default; either `--attachment-dir` or `--base-url` alone is enough (the other gets its own default filled in). |
+| `--base-url` | derived from `--bind` | Public base URL clients use to reach this server (e.g. `https://bus.example.com`), used to build attachment download URLs. A wildcard `--bind` host (`0.0.0.0`, `::`) is rewritten to `127.0.0.1` for this default; set `--base-url` explicitly behind a reverse proxy or for multi-host deployments. |
+| `--no-attachments` | `false` | Disables file attachments outright, even if `--attachment-dir`/`--base-url` are also given. The only way to opt out now that both have defaults. |
 | `--attachment-file-size-limit` | `15728640` (15 MiB) | Max size (bytes) of a single uploaded attachment. |
 | `--attachment-total-size-limit` | `5368709120` (5 GiB) | Max total size (bytes) of all stored attachments combined. |
 | `--attachment-expiry` | `3h` | How long an uploaded attachment is retained before being reclaimed (independent of, and typically shorter than, `--cache-duration`). |

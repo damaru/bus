@@ -35,7 +35,7 @@ enum Command {
         #[command(subcommand)]
         cmd: admin::AdminCommand,
         /// Directory of the sled embedded database (same as `bus serve --data-dir`).
-        #[arg(long, global = true, default_value = "./data")]
+        #[arg(long, global = true, default_value_os_t = bus::config::default_data_dir())]
         data_dir: PathBuf,
     },
 }
@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve(config: Config) -> anyhow::Result<()> {
+async fn serve(mut config: Config) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -60,6 +60,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         )
         .init();
 
+    config.finalize();
     config.validate()?;
 
     tracing::info!(bind = %config.bind, data_dir = ?config.data_dir, "starting bus server");
