@@ -94,7 +94,7 @@ impl Acl {
             || topic_pattern.len() > 64
             || topic_pattern
                 .chars()
-                .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '*'))
+                .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '*' || c == '.'))
         {
             bail!("invalid topic pattern '{topic_pattern}'");
         }

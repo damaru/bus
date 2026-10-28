@@ -95,7 +95,7 @@ pub fn parse_priority(s: &str) -> Result<u8, AppError> {
 pub fn validate_topic_name(name: &str) -> Result<(), AppError> {
     let valid = !name.is_empty()
         && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
     if valid {
         Ok(())
     } else {

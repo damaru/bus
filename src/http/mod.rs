@@ -18,6 +18,7 @@ use crate::store::users::Users;
 use crate::store::Store;
 use crate::topic::TopicRegistry;
 
+pub mod admin;
 pub mod attachment;
 pub mod bus;
 pub mod params;
@@ -69,6 +70,7 @@ pub fn router(state: AppState) -> Router {
     let body_limit = state.max_message_bytes as usize;
     Router::new()
         .route("/health", get(health))
+        .route("/admin/child-token", axum::routing::post(admin::mint_child_token))
         .route(
             "/",
             axum::routing::post(publish::publish_root).put(publish::publish_root),
