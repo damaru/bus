@@ -96,6 +96,7 @@ pub struct Topic {
     seq: AtomicU64,
     ring: Mutex<VecDeque<Envelope>>,
     ring_cap: usize,
+    history: bool,
     subscribers: Mutex<HashMap<SubscriberId, mpsc::Sender<Envelope>>>,
     next_subscriber_id: AtomicU64,
     cache: Arc<Cache>,
@@ -128,6 +129,7 @@ impl Topic {
         max_bus_per_topic: u64,
         total_subscribers: Arc<AtomicU64>,
         max_subscribers_total: u64,
+        history: bool,
     ) -> Self {
         let last_seq = cache.last_seq(&name).unwrap_or_else(|e| {
             tracing::warn!(topic = %name, error = %e, "failed to read persisted last_seq, starting from 0");
@@ -138,6 +140,7 @@ impl Topic {
             seq: AtomicU64::new(last_seq),
             ring: Mutex::new(VecDeque::with_capacity(ring_cap.min(256))),
             ring_cap,
+            history,
             subscribers: Mutex::new(HashMap::new()),
             next_subscriber_id: AtomicU64::new(0),
             cache,
@@ -183,9 +186,9 @@ impl Topic {
         let time = now_unix();
         let envelope = build(seq, id, time);
 
-        self.cache.store_message(&self.name, &envelope)?;
+        if self.history {
+            self.cache.store_message(&self.name, &envelope)?;
 
-        {
             let mut ring = self.ring.lock().unwrap();
             ring.push_back(envelope.clone());
             while ring.len() > self.ring_cap {
@@ -317,6 +320,9 @@ impl Topic {
     ///   always the newest, since `publish` appends before fan-out).
     /// - `None`: always empty, never needs sled.
     pub fn replay_since(&self, since: &SinceMarker) -> Vec<Envelope> {
+        if !self.history {
+            return Vec::new();
+        }
         let ring_result = {
             let ring = self.ring.lock().unwrap();
             match since {
@@ -544,6 +550,7 @@ pub struct TopicRegistry {
     ring_cap: usize,
     cache: Arc<Cache>,
     limits: TopicLimits,
+    history: bool,
     /// Shared with every `Topic` this registry creates — see
     /// `Topic::total_subscribers`'s doc comment.
     total_subscribers: Arc<AtomicU64>,
@@ -559,8 +566,14 @@ impl TopicRegistry {
             ring_cap: ring_cap.clamp(1, MAX_RING_CAPACITY),
             cache,
             limits,
+            history: true,
             total_subscribers: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn with_history(mut self, on: bool) -> Self {
+        self.history = on;
+        self
     }
 
     /// Returns the topic, creating it if it doesn't exist yet. A freshly
@@ -600,6 +613,7 @@ impl TopicRegistry {
                 self.limits.max_bus_participants_per_topic,
                 self.total_subscribers.clone(),
                 self.limits.max_subscribers_total,
+                self.history,
             ))
         });
         Ok(topic.clone())

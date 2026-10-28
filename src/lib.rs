@@ -31,7 +31,7 @@ pub fn build_state(config: &Config) -> anyhow::Result<http::AppState> {
         max_subscribers_total: config.max_subscribers_total,
         max_bus_participants_per_topic: config.max_bus_participants_per_topic,
     };
-    let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache, topic_limits));
+    let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache, topic_limits).with_history(config.history));
     let users = Arc::new(store.users());
     let acl = Arc::new(store.acl());
     let auth_limiter = Arc::new(auth::AuthLimiter::new());

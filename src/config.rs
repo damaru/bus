@@ -75,6 +75,16 @@ pub struct Config {
     #[arg(long, default_value_os_t = default_data_dir())]
     pub data_dir: PathBuf,
 
+    /// Serve on a Unix domain socket at this path instead of TCP `--bind`.
+    /// The socket is created with owner-only permissions.
+    #[arg(long)]
+    pub unix: Option<PathBuf>,
+
+    /// Keep no message history: publishes are not stored, and `since=`
+    /// replay returns nothing. Sequence numbers still advance.
+    #[arg(long = "no-history", action = clap::ArgAction::SetFalse)]
+    pub history: bool,
+
 
     /// How long cached messages are retained before being pruned.
     #[arg(long, default_value = "12h", value_parser = parse_duration_str)]
@@ -189,6 +199,8 @@ impl Default for Config {
         Self {
             bind: "127.0.0.1:8080".to_string(),
             data_dir: PathBuf::from("./data"),
+            unix: None,
+            history: true,
             cache_duration: std::time::Duration::from_secs(12 * 3600),
             cache_size: 1024 * 1024 * 1024,
             cache_count: 10_000,

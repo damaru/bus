@@ -52,6 +52,39 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn serve_unix(path: &std::path::Path, app: axum::Router) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use tower::ServiceExt;
+
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let svc = TowerToHyperService::new(app.clone().map_request(
+            |r: axum::http::Request<hyper::body::Incoming>| {
+                let mut r = r.map(axum::body::Body::new);
+                r.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 0))));
+                r
+            },
+        ));
+        tokio::spawn(async move {
+            if let Err(e) = Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(stream), svc)
+                .await
+            {
+                tracing::debug!(error = %e, "unix connection closed");
+            }
+        });
+    }
+}
+
 async fn serve(mut config: Config) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -88,6 +121,15 @@ async fn serve(mut config: Config) -> anyhow::Result<()> {
     }
 
     let app = bus::http::router(state);
+
+    if let Some(path) = config.unix.clone() {
+        tracing::info!(path = %path.display(), "listening on unix socket");
+        tokio::select! {
+            r = serve_unix(&path, app) => r?,
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        return Ok(());
+    }
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
