@@ -80,6 +80,11 @@ pub struct Config {
     #[arg(long)]
     pub unix: Option<PathBuf>,
 
+    /// With `--unix`, exit once no connection has been open for this long
+    /// (for example `10m`). Unset means run until stopped.
+    #[arg(long, value_parser = parse_duration_str)]
+    pub idle_exit: Option<std::time::Duration>,
+
     /// Keep no message history: publishes are not stored, and `since=`
     /// replay returns nothing. Sequence numbers still advance.
     #[arg(long = "no-history", action = clap::ArgAction::SetFalse)]
@@ -200,6 +205,7 @@ impl Default for Config {
             bind: "127.0.0.1:8080".to_string(),
             data_dir: PathBuf::from("./data"),
             unix: None,
+            idle_exit: None,
             history: true,
             cache_duration: std::time::Duration::from_secs(12 * 3600),
             cache_size: 1024 * 1024 * 1024,
