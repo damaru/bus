@@ -171,7 +171,17 @@ async fn run_bus(
     // `since=`. So the "filters don't meaningfully match e2e ciphertext"
     // caveat documented on `QueryFilter` (PLAN.md section 7) doesn't even
     // arise on this path; every backlog entry is replayed as-is.
-    for env in topic.replay_since(&since) {
+    let (backlog, lost) = topic.replay_checked(&since);
+    if lost {
+        let lost = Envelope::control(
+            topic_name.clone(),
+            Control::new(ControlType::Lost, "server").with_data(serde_json::json!({"since": format!("{since:?}")})),
+        );
+        if send_envelope(&mut socket, &lost).await.is_err() {
+            return;
+        }
+    }
+    for env in backlog {
         if send_envelope(&mut socket, &env).await.is_err() {
             return;
         }

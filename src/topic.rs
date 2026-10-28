@@ -368,6 +368,37 @@ impl Topic {
         }
     }
 
+    /// Returns the backlog for `since` plus a flag that is true when it cannot
+    /// be replayed in full (history disabled, or the `Id` anchor is in neither
+    /// the ring nor the cache), resolving the anchor with a single cache scan.
+    pub fn replay_checked(&self, since: &SinceMarker) -> (Vec<Envelope>, bool) {
+        if matches!(since, SinceMarker::None) {
+            return (Vec::new(), false);
+        }
+        if !self.history {
+            return (Vec::new(), true);
+        }
+        let SinceMarker::Id(id) = since else {
+            return (self.replay_since(since), false);
+        };
+        {
+            let ring = self.ring.lock().unwrap();
+            if let Some(pos) = ring.iter().position(|e| &e.id == id) {
+                return (ring.iter().skip(pos + 1).cloned().collect(), false);
+            }
+        }
+        match self.cache.messages_since(&self.name, &SinceMarker::All) {
+            Ok(all) => match all.iter().position(|e| &e.id == id) {
+                Some(p) => (all[p + 1..].to_vec(), false),
+                None => (Vec::new(), true),
+            },
+            Err(e) => {
+                tracing::warn!(topic = %self.name, error = %e, "sled backlog lookup failed, reporting backlog lost");
+                (Vec::new(), true)
+            }
+        }
+    }
+
     // ---- Bus extension (PLAN.md 5.2 / M4) ----
 
     /// Registers a new `/bus` participant: allocates a session id, shares

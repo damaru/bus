@@ -80,6 +80,8 @@ pub enum ControlType {
     Error,
     /// server -> client: server is terminating the connection.
     Close,
+    /// server -> client: sent before a backlog that could not be replayed in full.
+    Lost,
 }
 
 /// Bus control-message payload, present on an [`Envelope`] only when
