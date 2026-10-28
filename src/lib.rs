@@ -68,3 +68,75 @@ pub fn build_state(config: &Config) -> anyhow::Result<http::AppState> {
 pub fn build_router(config: &Config) -> anyhow::Result<axum::Router> {
     Ok(http::router(build_state(config)?))
 }
+
+/// Serves `app` on a Unix domain socket at `path` with owner-only mode.
+/// Each connection is run with a loopback `ConnectInfo`, since local
+/// clients are trusted the way loopback TCP clients are. With `idle`
+/// set, returns once no connection has been open for that long.
+pub async fn serve_unix(
+    path: &std::path::Path,
+    app: axum::Router,
+    idle: Option<std::time::Duration>,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
+    let idle_watch = {
+        let active = active.clone();
+        async move {
+            let Some(d) = idle else {
+                return std::future::pending::<()>().await;
+            };
+            let mut since = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if active.load(Ordering::SeqCst) > 0 {
+                    since = tokio::time::Instant::now();
+                } else if since.elapsed() >= d {
+                    return;
+                }
+            }
+        }
+    };
+    tokio::pin!(idle_watch);
+    loop {
+        let (stream, _) = tokio::select! {
+            r = listener.accept() => r?,
+            _ = &mut idle_watch => {
+                tracing::info!("idle timeout reached, exiting");
+                return Ok(());
+            }
+        };
+        let svc = TowerToHyperService::new(app.clone().map_request(
+            |r: axum::http::Request<hyper::body::Incoming>| {
+                let mut r = r.map(axum::body::Body::new);
+                r.extensions_mut().insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    0,
+                ))));
+                r
+            },
+        ));
+        active.fetch_add(1, Ordering::SeqCst);
+        let guard_active = active.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(TokioIo::new(stream), svc)
+                .await
+            {
+                tracing::debug!(error = %e, "unix connection closed");
+            }
+            guard_active.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+}
