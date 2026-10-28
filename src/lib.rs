@@ -34,6 +34,9 @@ pub fn build_state(config: &Config) -> anyhow::Result<http::AppState> {
     let topics = Arc::new(topic::TopicRegistry::new(config.cache_count as usize, cache, topic_limits).with_history(config.history));
     let users = Arc::new(store.users());
     let acl = Arc::new(store.acl());
+    if let Some(path) = &config.admin_token_file {
+        bootstrap_admin(&users, path)?;
+    }
     let auth_limiter = Arc::new(auth::AuthLimiter::new());
     let publish_limiter = Arc::new(auth::PublishLimiter::new(config.publish_rate_limit));
 
@@ -59,6 +62,38 @@ pub fn build_state(config: &Config) -> anyhow::Result<http::AppState> {
         base_url: config.base_url.clone(),
         attachment_expiry: config.attachment_expiry,
     })
+}
+
+fn bootstrap_admin(users: &store::users::Users, path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if users.get("root")?.is_some() {
+        users.delete("root")?;
+    }
+    let pw = format!("{:032x}{:032x}", rand::random::<u128>(), rand::random::<u128>());
+    users.create("root", &pw, store::users::Role::Admin)?;
+    let tok = users.issue_token("root", None)?;
+
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&dir)?;
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = dir.join(name);
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(format!("{tok}\n").as_bytes())?;
+    f.sync_all()?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Builds the top-level axum [`axum::Router`] directly from a [`Config`] —

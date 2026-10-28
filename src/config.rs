@@ -197,6 +197,9 @@ pub struct Config {
     /// retention duration).
     #[arg(long, default_value = "3h", value_parser = parse_duration_str)]
     pub attachment_expiry: std::time::Duration,
+
+    #[arg(long)]
+    pub admin_token_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -224,6 +227,7 @@ impl Default for Config {
             attachment_file_size_limit: 15 * 1024 * 1024,
             attachment_total_size_limit: 5 * 1024 * 1024 * 1024,
             attachment_expiry: std::time::Duration::from_secs(3 * 3600),
+            admin_token_file: None,
         }
     }
 }
