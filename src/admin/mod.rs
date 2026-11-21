@@ -5,13 +5,26 @@
 //! Since sled locks its data directory to a single process, the server
 //! must not be running against the same `--data-dir` while an admin
 //! command runs (stop the server, run the command, restart it).
+//!
+//! Exception: `POST /admin/purge` ([`purge`]) is the one HTTP admin route,
+//! mounted by `http::router`.
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, State};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, Uri};
+use axum::Json;
 use clap::Subcommand;
+use serde::{Deserialize, Serialize};
 
+use crate::auth;
+use crate::error::AppError;
+use crate::http::{params, AppState};
 use crate::store::acl::{Acl, Permission};
 use crate::store::users::Role;
 use crate::store::Store;
@@ -181,4 +194,56 @@ fn parse_ttl(s: &str) -> anyhow::Result<Duration> {
     };
     let n: u64 = num.parse().map_err(|_| anyhow::anyhow!("invalid ttl: {s}"))?;
     Ok(Duration::from_secs(n * mult))
+}
+
+const PURGE_MAX_TOPICS: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+struct PurgeRequest {
+    topics: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgeResponse {
+    pub purged: usize,
+}
+
+/// Handles `POST /admin/purge` with `{"topics": [...]}`: drops the stored
+/// history of each named topic and returns `{"purged": N}`. Admin-only.
+pub async fn purge(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Result<Json<PurgeResponse>, AppError> {
+    let query = params::parse_query(&uri);
+    let visitor = auth::authenticate(&headers, &query, addr.ip(), &state.users, &state.auth_limiter)?;
+    if !visitor.is_admin {
+        return Err(AppError::Forbidden("admin only".to_string()));
+    }
+
+    let is_json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return Err(AppError::UnsupportedMediaType("Content-Type must be application/json".to_string()));
+    }
+    let req: PurgeRequest =
+        serde_json::from_slice(&body).map_err(|e| AppError::BadRequest(format!("invalid JSON body: {e}")))?;
+    if req.topics.len() > PURGE_MAX_TOPICS {
+        return Err(AppError::BadRequest(format!("at most {PURGE_MAX_TOPICS} topics per purge")));
+    }
+    for name in &req.topics {
+        params::validate_topic_name(name)?;
+    }
+
+    let purged = state
+        .topics
+        .purge(&req.topics)
+        .map_err(|e| AppError::Internal(format!("failed to purge topics: {e}")))?;
+    Ok(Json(PurgeResponse { purged }))
 }

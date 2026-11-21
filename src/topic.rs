@@ -650,6 +650,21 @@ impl TopicRegistry {
         Ok(topic.clone())
     }
 
+    /// Drops the stored history of each named topic, both the durable sled
+    /// messages and the in-memory ring, and returns the total dropped.
+    /// Unknown topics count 0. Topic objects, sequence counters and live
+    /// subscribers are left alone, so the next publish continues the sequence.
+    pub fn purge(&self, names: &[String]) -> Result<usize> {
+        let mut dropped = 0;
+        for name in names {
+            dropped += self.cache.purge(name)?;
+            if let Some(topic) = self.topics.get(name) {
+                topic.ring.lock().unwrap().clear();
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Broadcasts a `close` control message to every `/bus` participant on
     /// every topic — called once at the start of graceful shutdown (M6),
     /// see `Topic::broadcast_close`.

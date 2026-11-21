@@ -236,6 +236,25 @@ impl Cache {
         })
     }
 
+    /// Removes every persisted message for `topic` and returns how many were
+    /// dropped. The `topic_meta` entry is kept so sequence numbers keep
+    /// counting up. A topic with no message tree is a no-op (0).
+    pub fn purge(&self, topic: &str) -> Result<usize> {
+        let name = format!("{MSGS_TREE_PREFIX}{topic}");
+        if !self.db.tree_names().iter().any(|n| n.as_ref() == name.as_bytes()) {
+            return Ok(0);
+        }
+        let tree = self.msgs_tree(topic)?;
+        let mut dropped = 0;
+        for item in tree.iter() {
+            let (key, _) = item.context("iterating msgs tree for purge")?;
+            if tree.remove(&key).context("removing message during purge")?.is_some() {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     /// Lists every topic that has at least one persisted message tree
     /// (used by the background retention sweep to enumerate what to prune).
     pub fn topics(&self) -> Vec<String> {

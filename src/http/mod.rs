@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
             "/file/:id",
             axum::routing::get(attachment::download).head(attachment::download),
         )
+        .route("/admin/purge", axum::routing::post(crate::admin::purge))
         .route(
             "/:topic",
             axum::routing::post(publish::publish).put(publish::publish),
